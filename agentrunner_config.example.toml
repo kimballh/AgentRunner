@@ -1,0 +1,47 @@
+# AgentRunner project-local config.
+# Copy to ./agentrunner_config.toml and keep secrets in ./.env.
+
+database_url_env_var = "AGENTRUNNER_DATABASE_URL"
+database_schema = "public"
+database_table = "agent_runs"
+
+agent_provider = "both"
+default_agent_provider = "codex"
+agent_mode = "exec"
+num_workers = 1
+poll_frequency_ms = 60000
+stale_after_ms = 900000
+host = "127.0.0.1"
+port = 0
+
+[git]
+# "auto" creates worktrees when started inside a Git repo, and uses cwd outside Git.
+# Use "always" to require Git worktrees, or "never" to always execute in cwd.
+create_worktrees = "auto"
+repo = ""
+base_branch = ""
+remote = "origin"
+branch_prefix = "agentrunner"
+worktree_dir = ".worktrees"
+max_worktrees = 25
+cleanup_batch_size = 5
+cleanup_delete_branches = false
+setup = "auto"
+setup_script = ""
+setup_command = []
+
+[codex]
+bin = "codex"
+default_model = ""
+default_reasoning_effort = ""
+bypass_approvals_and_sandbox = true
+extra_args = []
+app_server_extra_args = []
+config = []
+
+[claude]
+bin = "claude"
+default_model = ""
+default_reasoning_effort = ""
+permission_mode = ""
+extra_args = []
