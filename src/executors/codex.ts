@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { readLines, runProcess, streamToString } from "../process.js";
 import { redactSecrets } from "../redact.js";
@@ -86,6 +86,7 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
     env: process.env,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  const closePromise = once(subprocess, "close").then(() => undefined);
 
   const stdoutLines: string[] = [];
   const conversation: unknown[] = [];
@@ -201,7 +202,7 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
     });
 
     await completedPromise;
-    const stderr = redactSecrets(await stderrPromise);
+    const stderr = redactSecrets(await stopAppServer(subprocess, closePromise, stderrPromise));
     return {
       exitCode: 0,
       link: threadUrl(threadId),
@@ -211,7 +212,7 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
       result: { provider: "codex", mode: "app-server" },
     };
   } catch (error) {
-    const stderr = redactSecrets(await stderrPromise.catch(() => ""));
+    const stderr = redactSecrets(await stopAppServer(subprocess, closePromise, stderrPromise).catch(() => ""));
     return {
       exitCode: 1,
       link: threadId ? threadUrl(threadId) : undefined,
@@ -225,9 +226,6 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
         message: error instanceof Error ? error.message : String(error),
       },
     };
-  } finally {
-    subprocess.kill();
-    await once(subprocess, "close").catch(() => undefined);
   }
 }
 
@@ -256,6 +254,16 @@ function codexAppServerCommand(input: ExecutionInput): string[] {
   }
   command.push(...input.config.codex.appServerExtraArgs);
   return command;
+}
+
+async function stopAppServer(
+  subprocess: ChildProcessWithoutNullStreams,
+  closePromise: Promise<void>,
+  stderrPromise: Promise<string>,
+): Promise<string> {
+  subprocess.kill();
+  await closePromise.catch(() => undefined);
+  return stderrPromise.catch(() => "");
 }
 
 function appServerSandbox(config: ServiceConfig): string | null {
