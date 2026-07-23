@@ -1,7 +1,10 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { AgentRunStore } from "./store.js";
-import type { AgentRunRow, ServiceConfig, WorkerStats } from "./types.js";
+import { AgentRunStore, type RunListCursor, type RunListOptions, type RunListPage } from "./store.js";
+import type { RunListItem, ServiceConfig, WorkerStats } from "./types.js";
+
+const DEFAULT_RUN_LIMIT = 25;
+const MAX_RUN_LIMIT = 100;
 
 export interface DashboardServer {
   url: string;
@@ -20,12 +23,14 @@ export async function startDashboard(input: {
         return json(response, { ok: true, ...input.stats() });
       }
       if (request.method === "GET" && url.pathname === "/runs") {
-        const runs = await input.store.listRuns();
-        return html(response, renderRunsPage({ runs, stats: input.stats(), config: input.config }));
+        const pagination = parseRunListOptions(url.searchParams);
+        const page = await input.store.listRuns(pagination);
+        return html(response, renderRunsPage({ page, pagination, stats: input.stats(), config: input.config }));
       }
       if (request.method === "GET" && url.pathname === "/api/runs") {
-        const runs = await input.store.listRuns();
-        return json(response, { runs, stats: input.stats() });
+        const pagination = parseRunListOptions(url.searchParams);
+        const page = await input.store.listRuns(pagination);
+        return json(response, { ...page, pagination, stats: input.stats() });
       }
 
       const detailMatch = /^\/api\/runs\/(\d+)$/.exec(url.pathname);
@@ -79,8 +84,15 @@ export async function startDashboard(input: {
   };
 }
 
-export function renderRunsPage(input: { runs: AgentRunRow[]; stats: WorkerStats; config: ServiceConfig }): string {
-  const rows = input.runs.map(runRow).join("");
+export function renderRunsPage(input: {
+  page: RunListPage;
+  pagination?: RunListOptions;
+  stats: WorkerStats;
+  config: ServiceConfig;
+}): string {
+  const pagination = input.pagination ?? {};
+  const rows = input.page.runs.map(runRow).join("");
+  const controls = renderPaginationControls(input.page, pagination);
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -94,6 +106,10 @@ export function renderRunsPage(input: { runs: AgentRunRow[]; stats: WorkerStats;
     .stats { display: flex; gap: 10px; flex-wrap: wrap; }
     .stat { padding: 6px 10px; border: 1px solid #d9dee8; border-radius: 6px; background: #fbfcfe; }
     main { padding: 18px 24px; overflow-x: auto; }
+    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; min-width: 1120px; }
+    .toolbar form, .pagination { display: flex; align-items: center; gap: 8px; }
+    label { color: #59657a; font-size: 13px; }
+    select { border: 1px solid #bcc5d3; background: #fff; color: #172033; border-radius: 5px; padding: 4px 8px; font: inherit; }
     table { width: 100%; min-width: 1120px; border-collapse: collapse; background: #fff; border: 1px solid #d9dee8; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #e6eaf0; text-align: left; vertical-align: top; }
     th { font-size: 12px; text-transform: uppercase; color: #59657a; background: #f1f4f8; letter-spacing: 0; }
@@ -107,6 +123,7 @@ export function renderRunsPage(input: { runs: AgentRunRow[]; stats: WorkerStats;
     .muted { color: #667085; }
     .actions { display: flex; gap: 6px; flex-wrap: wrap; min-width: 172px; }
     button, .link-button { border: 1px solid #bcc5d3; background: #fff; color: #172033; border-radius: 5px; padding: 4px 8px; cursor: pointer; text-decoration: none; font: inherit; white-space: nowrap; }
+    .link-button[aria-disabled="true"] { pointer-events: none; cursor: not-allowed; opacity: 0.45; }
     button:disabled { cursor: not-allowed; opacity: 0.45; }
     .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(16, 24, 40, 0.45); align-items: center; justify-content: center; padding: 24px; }
     .modal { width: min(960px, calc(100vw - 48px)); max-height: 84vh; overflow: auto; background: #fff; border-radius: 8px; box-shadow: 0 20px 50px rgba(16, 24, 40, 0.2); }
@@ -130,6 +147,17 @@ export function renderRunsPage(input: { runs: AgentRunRow[]; stats: WorkerStats;
     </div>
   </header>
   <main>
+    <div class="toolbar">
+      <form method="get" action="/runs">
+        <label for="limit">Rows</label>
+        <select id="limit" name="limit" onchange="this.form.submit()">
+          ${limitOption(25, pagination.limit)}
+          ${limitOption(50, pagination.limit)}
+          ${limitOption(100, pagination.limit)}
+        </select>
+      </form>
+      ${controls}
+    </div>
     <table>
       <thead>
         <tr>
@@ -149,6 +177,7 @@ export function renderRunsPage(input: { runs: AgentRunRow[]; stats: WorkerStats;
       </thead>
       <tbody>${rows || `<tr><td colspan="12" class="muted">No runs yet.</td></tr>`}</tbody>
     </table>
+    <div class="toolbar">${controls}</div>
   </main>
   <div id="modalBackdrop" class="modal-backdrop" role="dialog" aria-modal="true">
     <section class="modal">
@@ -183,7 +212,7 @@ export function renderRunsPage(input: { runs: AgentRunRow[]; stats: WorkerStats;
 </html>`;
 }
 
-function runRow(run: AgentRunRow): string {
+function runRow(run: RunListItem): string {
   return `<tr>
     <td><span class="status status-${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></td>
     <td><strong>${escapeHtml(run.uid)}</strong><br><code>#${run.id}</code></td>
@@ -207,12 +236,87 @@ function runRow(run: AgentRunRow): string {
     <td>${escapeHtml(truncate(run.last_message ?? "", 180))}</td>
     <td><div class="actions">
       <button type="button" onclick="openText('Prompt', '/api/runs/${run.id}/prompt')">Prompt</button>
-      <button type="button" ${run.error ? "" : "disabled"} onclick="openText('Error', '/api/runs/${run.id}/error')">Error</button>
-      <button type="button" ${run.logs ? "" : "disabled"} onclick="openText('Logs', '/api/runs/${run.id}/logs')">Logs</button>
-      <button type="button" ${run.setup_logs ? "" : "disabled"} onclick="openText('Setup logs', '/api/runs/${run.id}/setup-logs')">Setup</button>
-      <a class="link-button" href="/api/runs/${run.id}/conversation">Conversation</a>
+      <button type="button" ${run.has_error ? "" : "disabled"} onclick="openText('Error', '/api/runs/${run.id}/error')">Error</button>
+      <button type="button" ${run.has_logs ? "" : "disabled"} onclick="openText('Logs', '/api/runs/${run.id}/logs')">Logs</button>
+      <button type="button" ${run.has_setup_logs ? "" : "disabled"} onclick="openText('Setup logs', '/api/runs/${run.id}/setup-logs')">Setup</button>
+      <a class="link-button" ${run.has_conversation ? "" : `aria-disabled="true"`} href="/api/runs/${run.id}/conversation">Conversation</a>
     </div></td>
   </tr>`;
+}
+
+function parseRunListOptions(search: URLSearchParams): RunListOptions {
+  const limit = boundedLimit(search.get("limit"));
+  const before = decodeCursor(search.get("before"));
+  const after = before ? undefined : decodeCursor(search.get("after"));
+  return { limit, before, after };
+}
+
+function boundedLimit(value: string | null): number {
+  const parsed = value ? Number(value) : DEFAULT_RUN_LIMIT;
+  if (!Number.isInteger(parsed)) {
+    return DEFAULT_RUN_LIMIT;
+  }
+  return Math.min(MAX_RUN_LIMIT, Math.max(5, parsed));
+}
+
+function renderPaginationControls(page: RunListPage, pagination: RunListOptions): string {
+  const first = page.runs[0];
+  const last = page.runs.at(-1);
+  const hasCursor = Boolean(pagination.before || pagination.after);
+  const isMovingNewer = Boolean(pagination.after);
+  const hasNewer = (isMovingNewer ? page.hasMore : hasCursor) && Boolean(first);
+  const hasOlder = (isMovingNewer ? true : page.hasMore) && Boolean(last);
+  const newerHref = first ? runsHref({ limit: pagination.limit, after: cursorFor(first) }) : "";
+  const olderHref = last ? runsHref({ limit: pagination.limit, before: cursorFor(last) }) : "";
+  return `<nav class="pagination" aria-label="Runs pagination">
+    <a class="link-button" href="${runsHref({ limit: pagination.limit })}">Newest</a>
+    <a class="link-button" ${hasNewer ? `href="${newerHref}"` : `aria-disabled="true"`}>Newer</a>
+    <span class="muted">${page.runs.length} row${page.runs.length === 1 ? "" : "s"}</span>
+    <a class="link-button" ${hasOlder ? `href="${olderHref}"` : `aria-disabled="true"`}>Older</a>
+  </nav>`;
+}
+
+function limitOption(value: number, selected = DEFAULT_RUN_LIMIT): string {
+  return `<option value="${value}" ${value === selected ? "selected" : ""}>${value}</option>`;
+}
+
+function runsHref(options: { limit?: number; before?: RunListCursor; after?: RunListCursor }): string {
+  const params = new URLSearchParams();
+  if (options.limit && options.limit !== DEFAULT_RUN_LIMIT) {
+    params.set("limit", String(options.limit));
+  }
+  if (options.before) {
+    params.set("before", encodeCursor(options.before));
+  }
+  if (options.after) {
+    params.set("after", encodeCursor(options.after));
+  }
+  const query = params.toString();
+  return query ? `/runs?${query}` : "/runs";
+}
+
+function cursorFor(run: RunListItem): RunListCursor {
+  return { createdAt: run.created_at_cursor, id: run.id };
+}
+
+function encodeCursor(cursor: RunListCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeCursor(value: string | null): RunListCursor | undefined {
+  if (!value) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Partial<RunListCursor>;
+    const id = parsed.id;
+    if (typeof parsed.createdAt !== "string" || typeof id !== "number" || !Number.isInteger(id)) {
+      return undefined;
+    }
+    return { createdAt: parsed.createdAt, id };
+  } catch {
+    return undefined;
+  }
 }
 
 function json(response: http.ServerResponse, value: unknown, status = 200): void {

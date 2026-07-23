@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { runCommandOrThrow, runProcess, type ProcessResult } from "./process.js";
-import type { AgentRunRow, ServiceConfig, WorkspaceResult } from "./types.js";
+import type { AgentRunRow, CompletedRunForCleanup, ServiceConfig, WorkspaceResult } from "./types.js";
 
 export interface WorkspaceCommandRunner {
   run(command: string[], options: { cwd: string; label: string }): Promise<ProcessResult>;
@@ -16,7 +16,7 @@ export const defaultWorkspaceRunner: WorkspaceCommandRunner = {
 export interface WorkspacePreparationInput {
   config: ServiceConfig;
   run: AgentRunRow;
-  completedRuns: AgentRunRow[];
+  completedRuns: CompletedRunForCleanup[];
   runner?: WorkspaceCommandRunner;
 }
 
@@ -155,7 +155,7 @@ async function cleanupOldWorktrees(input: {
   config: ServiceConfig;
   repoRoot: string;
   worktreeRoot: string;
-  completedRuns: AgentRunRow[];
+  completedRuns: CompletedRunForCleanup[];
   runner: WorkspaceCommandRunner;
 }): Promise<string | undefined> {
   if (input.config.git.maxWorktrees <= 0) {

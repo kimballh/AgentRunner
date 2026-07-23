@@ -12,6 +12,8 @@ describe("sql helpers", () => {
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS locked_by text");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS worktree_path text");
     expect(sql).toContain("agent_runs_status_priority_idx");
+    expect(sql).toContain("agent_runs_created_at_id_idx");
+    expect(sql).toContain("agent_runs_completed_worktree_cleanup_idx");
   });
 
   test("prints force drop SQL for configured table only", () => {

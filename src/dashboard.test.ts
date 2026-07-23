@@ -5,13 +5,27 @@ import type { AgentRunRow, ServiceConfig } from "./types.js";
 describe("renderRunsPage", () => {
   test("escapes row values", () => {
     const html = renderRunsPage({
-      runs: [row({ uid: "<script>x</script>", prompt: "prompt" })],
+      page: { runs: [listRow({ uid: "<script>x</script>" })], hasMore: false },
       stats: { active: 0, queued: 1, maxWorkers: 1, availableWorkers: 1 },
       config: config(),
     });
 
     expect(html).toContain("&lt;script&gt;x&lt;/script&gt;");
     expect(html).not.toContain("<script>x</script>");
+  });
+
+  test("renders bounded pagination controls", () => {
+    const html = renderRunsPage({
+      page: { runs: [listRow({ id: 42 })], hasMore: true },
+      pagination: { limit: 25 },
+      stats: { active: 0, queued: 1, maxWorkers: 1, availableWorkers: 1 },
+      config: config(),
+    });
+
+    expect(html).toContain("Rows");
+    expect(html).toContain("Older");
+    expect(html).toContain("before=");
+    expect(html).toContain("25</option>");
   });
 });
 
@@ -69,5 +83,37 @@ function row(overrides: Partial<AgentRunRow>): AgentRunRow {
     agent_mode: null,
     num_retries: null,
     ...overrides,
+  };
+}
+
+function listRow(overrides: Partial<ReturnType<typeof row>> & { created_at_cursor?: string } = {}) {
+  const base = row(overrides);
+  return {
+    id: base.id,
+    status: base.status,
+    uid: base.uid,
+    created_at: base.created_at,
+    created_at_cursor: overrides.created_at_cursor ?? "2026-01-01T00:00:00.000000",
+    finished_at: base.finished_at,
+    link: base.link,
+    last_message: base.last_message,
+    attempts: base.attempts,
+    priority: base.priority,
+    model_name: base.model_name,
+    reasoning_effort: base.reasoning_effort,
+    agent_provider: base.agent_provider,
+    agent_mode: base.agent_mode,
+    num_retries: base.num_retries,
+    started_at: base.started_at,
+    updated_at: base.updated_at,
+    repo_path: base.repo_path,
+    worktree_path: base.worktree_path,
+    branch_name: base.branch_name,
+    base_branch: base.base_branch,
+    cleanup_note: base.cleanup_note,
+    has_error: base.error !== null,
+    has_logs: Boolean(base.logs),
+    has_setup_logs: Boolean(base.setup_logs),
+    has_conversation: base.conversation !== null,
   };
 }

@@ -28,7 +28,12 @@ export class AgentRunnerService {
     console.log(`AgentRunner dashboard: ${this.dashboard.url}`);
 
     for (let index = 0; index < this.config.numWorkers; index++) {
-      void this.workerLoop(`${this.workerIdPrefix}-${index + 1}`);
+      const workerId = `${this.workerIdPrefix}-${index + 1}`;
+      void this.workerLoop(workerId).catch((error) => {
+        if (!this.stopping) {
+          console.error(`Worker ${workerId} stopped unexpectedly: ${errorMessage(error)}`);
+        }
+      });
     }
     this.pollTimer = setInterval(() => {
       void this.refreshQueued();
@@ -60,7 +65,15 @@ export class AgentRunnerService {
 
   private async workerLoop(workerId: string): Promise<void> {
     while (!this.stopping) {
-      const claimed = await this.store.claimNext(workerId);
+      let claimed;
+      try {
+        claimed = await this.store.claimNext(workerId);
+      } catch (error) {
+        this.logWorkerError(workerId, "claiming next run", error);
+        await this.sleep(this.config.pollFrequencyMs);
+        continue;
+      }
+
       if (!claimed) {
         await this.sleep(this.config.pollFrequencyMs);
         continue;
@@ -69,12 +82,17 @@ export class AgentRunnerService {
       this.active++;
       await this.refreshQueued();
       const heartbeat = setInterval(() => {
-        void this.store.heartbeat(claimed.row.id, workerId);
+        void this.store
+          .heartbeat(claimed.row.id, workerId)
+          .catch((error) => this.logWorkerError(workerId, `heartbeating run ${claimed.row.id}`, error));
       }, Math.min(30_000, Math.max(5_000, Math.floor(this.config.staleAfterMs / 3))));
 
       let workspace: WorkspaceResult | undefined;
       try {
-        const completedRuns = await this.store.completedRunsOldestFirst();
+        const completedRuns =
+          this.config.git.maxWorktrees > 0
+            ? await this.store.completedRunsOldestFirst(this.cleanupCandidateLimit())
+            : [];
         workspace = await prepareWorkspace({
           config: this.config,
           run: claimed.row,
@@ -119,13 +137,23 @@ export class AgentRunnerService {
         }
       } catch (error) {
         const result = workspace ? failureResultForWorkspace(workspace) : undefined;
-        await this.store.markFailed(claimed.row.id, workerId, claimed.row, errorToJson(error), result);
+        await this.store.markFailed(claimed.row.id, workerId, claimed.row, errorToJson(error), result).catch((markError) => {
+          this.logWorkerError(workerId, `marking run ${claimed.row.id} failed`, markError);
+        });
       } finally {
         clearInterval(heartbeat);
         this.active--;
         await this.refreshQueued();
       }
     }
+  }
+
+  private logWorkerError(workerId: string, action: string, error: unknown): void {
+    console.warn(`Worker ${workerId} error while ${action}: ${errorMessage(error)}`);
+  }
+
+  private cleanupCandidateLimit(): number {
+    return Math.max(100, this.config.git.maxWorktrees * 2, this.config.git.maxWorktrees + this.config.git.cleanupBatchSize);
   }
 
   private sleep(ms: number): Promise<void> {
@@ -139,4 +167,8 @@ function failureResultForWorkspace(workspace: WorkspaceResult): ExecutionResult 
     logs: workspace.setupLogs ?? "",
     workspace,
   };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

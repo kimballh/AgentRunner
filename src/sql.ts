@@ -65,6 +65,14 @@ ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS cleanup_note text;
 CREATE INDEX IF NOT EXISTS agent_runs_status_priority_idx
     ON ${table} (status, priority DESC, created_at ASC);
 
+CREATE INDEX IF NOT EXISTS agent_runs_created_at_id_idx
+    ON ${table} (created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS agent_runs_completed_worktree_cleanup_idx
+    ON ${table} ((COALESCE(finished_at, updated_at, created_at)))
+    INCLUDE (id, worktree_path, branch_name)
+    WHERE worktree_path IS NOT NULL AND status IN ('succeeded', 'failed');
+
 CREATE INDEX IF NOT EXISTS agent_runs_locked_at_idx
     ON ${table} (locked_at);`;
 }

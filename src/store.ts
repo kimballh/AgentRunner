@@ -2,7 +2,31 @@ import { Pool, type PoolClient } from "pg";
 import { parseAgentMode, parseAgentProvider } from "./config.js";
 import { qualifiedTable } from "./sql.js";
 import { resolveRunConfig } from "./selection.js";
-import type { AgentRunRow, ClaimedRun, ExecutionResult, ServiceConfig, WorkspaceResult } from "./types.js";
+import type {
+  AgentRunRow,
+  ClaimedRun,
+  CompletedRunForCleanup,
+  ExecutionResult,
+  RunListItem,
+  ServiceConfig,
+  WorkspaceResult,
+} from "./types.js";
+
+export interface RunListCursor {
+  createdAt: string;
+  id: number;
+}
+
+export interface RunListOptions {
+  limit?: number;
+  before?: RunListCursor;
+  after?: RunListCursor;
+}
+
+export interface RunListPage {
+  runs: RunListItem[];
+  hasMore: boolean;
+}
 
 export class AgentRunStore {
   private readonly pool: Pool;
@@ -10,6 +34,9 @@ export class AgentRunStore {
 
   constructor(private readonly config: ServiceConfig) {
     this.pool = new Pool({ connectionString: config.databaseUrl });
+    this.pool.on("error", (error) => {
+      console.warn(`Database connection error on idle client: ${errorMessage(error)}`);
+    });
     this.table = qualifiedTable(config);
   }
 
@@ -39,14 +66,54 @@ export class AgentRunStore {
     return Number(result.rows[0]?.count ?? 0);
   }
 
-  async listRuns(limit = 200): Promise<AgentRunRow[]> {
-    const result = await this.pool.query<AgentRunRow>(
-      `SELECT * FROM ${this.table}
-       ORDER BY created_at DESC
+  async listRuns(options: RunListOptions = {}): Promise<RunListPage> {
+    const limit = options.limit ?? 25;
+    const cursor = options.before ?? options.after;
+    const comparison = options.before ? "<" : options.after ? ">" : undefined;
+    const order = options.after ? "ASC" : "DESC";
+    const params: unknown[] = [limit + 1];
+    let where = "";
+    if (comparison && cursor) {
+      params.push(cursor.createdAt, cursor.id);
+      where = `WHERE (created_at, id) ${comparison} (($2::text)::timestamp, $3::integer)`;
+    }
+
+    const result = await this.pool.query<RunListItem>(
+      `SELECT id,
+              status,
+              uid,
+              created_at,
+              to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at_cursor,
+              finished_at,
+              link,
+              last_message,
+              attempts,
+              priority,
+              model_name,
+              reasoning_effort,
+              agent_provider,
+              agent_mode,
+              num_retries,
+              started_at,
+              updated_at,
+              repo_path,
+              worktree_path,
+              branch_name,
+              base_branch,
+              cleanup_note,
+              error IS NOT NULL AS has_error,
+              logs IS NOT NULL AND logs <> '' AS has_logs,
+              setup_logs IS NOT NULL AND setup_logs <> '' AS has_setup_logs,
+              conversation IS NOT NULL AS has_conversation
+       FROM ${this.table}
+       ${where}
+       ORDER BY created_at ${order}, id ${order}
        LIMIT $1`,
-      [limit],
+      params,
     );
-    return result.rows;
+    const hasMore = result.rows.length > limit;
+    const runs = result.rows.slice(0, limit);
+    return { runs: options.after ? runs.reverse() : runs, hasMore };
   }
 
   async getRun(id: number): Promise<AgentRunRow | undefined> {
@@ -54,9 +121,10 @@ export class AgentRunStore {
     return result.rows[0];
   }
 
-  async completedRunsOldestFirst(limit = 10_000): Promise<AgentRunRow[]> {
-    const result = await this.pool.query<AgentRunRow>(
-      `SELECT * FROM ${this.table}
+  async completedRunsOldestFirst(limit = 10_000): Promise<CompletedRunForCleanup[]> {
+    const result = await this.pool.query<CompletedRunForCleanup>(
+      `SELECT id, created_at, finished_at, updated_at, worktree_path, branch_name
+       FROM ${this.table}
        WHERE worktree_path IS NOT NULL
          AND status IN ('succeeded', 'failed')
        ORDER BY COALESCE(finished_at, updated_at, created_at) ASC
@@ -92,6 +160,13 @@ export class AgentRunStore {
 
   async claimNext(workerId: string): Promise<ClaimedRun | undefined> {
     const client = await this.pool.connect();
+    let clientError: Error | undefined;
+    const onClientError = (error: Error): void => {
+      clientError = error;
+      console.warn(`Database connection error on active client: ${errorMessage(error)}`);
+    };
+
+    client.on("error", onClientError);
     try {
       await client.query("BEGIN");
       const selected = await client.query<AgentRunRow>(
@@ -141,7 +216,8 @@ export class AgentRunStore {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
     } finally {
-      client.release();
+      client.removeListener("error", onClientError);
+      client.release(clientError);
     }
   }
 
@@ -273,4 +349,8 @@ export function errorToJson(error: unknown): Record<string, unknown> {
     };
   }
   return { message: String(error) };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

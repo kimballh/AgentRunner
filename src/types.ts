@@ -94,6 +94,44 @@ export interface AgentRunRow {
   cleanup_note?: string | null;
 }
 
+export interface RunListItem {
+  id: number;
+  status: RunStatus | string;
+  uid: string;
+  created_at: Date;
+  created_at_cursor: string;
+  finished_at: Date | null;
+  link: string | null;
+  last_message: string | null;
+  attempts: number | null;
+  priority: number;
+  model_name: string | null;
+  reasoning_effort: string | null;
+  agent_provider: string | null;
+  agent_mode: string | null;
+  num_retries: number | null;
+  started_at?: Date | null;
+  updated_at?: Date | null;
+  repo_path?: string | null;
+  worktree_path?: string | null;
+  branch_name?: string | null;
+  base_branch?: string | null;
+  cleanup_note?: string | null;
+  has_error: boolean;
+  has_logs: boolean;
+  has_setup_logs: boolean;
+  has_conversation: boolean;
+}
+
+export interface CompletedRunForCleanup {
+  id: number;
+  created_at: Date;
+  finished_at: Date | null;
+  updated_at?: Date | null;
+  worktree_path: string | null;
+  branch_name?: string | null;
+}
+
 export interface ResolvedRunConfig {
   provider: AgentProvider;
   mode: AgentMode;
