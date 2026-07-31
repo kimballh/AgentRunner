@@ -16,6 +16,8 @@ export interface ConfigOverrides {
   numWorkers?: string | number;
   pollFrequencyMs?: string | number;
   staleAfterMs?: string | number;
+  preflightRetries?: string | number;
+  preflightRetryDelayMs?: string | number;
   host?: string;
   port?: string | number;
   createWorktrees?: string;
@@ -108,6 +110,20 @@ export async function loadConfig(
         numberFrom(toml.stale_after_ms) ??
         15 * 60_000,
       "stale_after_ms",
+    ),
+    preflightRetries: nonNegativeInteger(
+      numberFrom(overrides.preflightRetries) ??
+        envNumber("AGENTRUNNER_PREFLIGHT_RETRIES") ??
+        numberFrom(toml.preflight_retries) ??
+        2,
+      "preflight_retries",
+    ),
+    preflightRetryDelayMs: nonNegativeInteger(
+      numberFrom(overrides.preflightRetryDelayMs) ??
+        envNumber("AGENTRUNNER_PREFLIGHT_RETRY_DELAY_MS") ??
+        numberFrom(toml.preflight_retry_delay_ms) ??
+        1_000,
+      "preflight_retry_delay_ms",
     ),
     host: stringFrom(overrides.host) ?? optionalEnv("AGENTRUNNER_HOST") ?? stringFrom(toml.host) ?? "127.0.0.1",
     port: nonNegativeInteger(

@@ -52,6 +52,8 @@ export interface ServiceConfig {
   numWorkers: number;
   pollFrequencyMs: number;
   staleAfterMs: number;
+  preflightRetries: number;
+  preflightRetryDelayMs: number;
   host: string;
   port: number;
   git: GitConfig;
@@ -126,12 +128,9 @@ export interface RunListItem {
 
 export interface CompletedRunForCleanup {
   id: number;
-  created_at: Date;
-  finished_at: Date | null;
-  updated_at?: Date | null;
-  cleanup_at: Date;
   worktree_path: string | null;
   branch_name?: string | null;
+  status: RunStatus | string;
 }
 
 export interface ResolvedRunConfig {

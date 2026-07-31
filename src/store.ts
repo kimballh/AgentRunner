@@ -121,42 +121,19 @@ export class AgentRunStore {
     return result.rows[0];
   }
 
-  async *completedRunsOldestFirst(pageSize = 100): AsyncGenerator<CompletedRunForCleanup> {
-    let afterCleanupAt: Date | undefined;
-    let afterId: number | undefined;
-
-    while (true) {
-      const result = await this.pool.query<CompletedRunForCleanup>(
-        `SELECT id,
-                created_at,
-                finished_at,
-                updated_at,
-                COALESCE(finished_at, updated_at, created_at) AS cleanup_at,
-                worktree_path,
-                branch_name
-         FROM ${this.table}
-         WHERE worktree_path IS NOT NULL
-           AND worktree_removed_at IS NULL
-           AND status IN ('succeeded', 'failed')
-           AND ($2::timestamp IS NULL OR (COALESCE(finished_at, updated_at, created_at), id) > ($2, $3))
-         ORDER BY COALESCE(finished_at, updated_at, created_at) ASC, id ASC
-         LIMIT $1`,
-        [pageSize, afterCleanupAt ?? null, afterId ?? null],
-      );
-      if (result.rows.length === 0) {
-        return;
-      }
-
-      for (const row of result.rows) {
-        yield row;
-      }
-      if (result.rows.length < pageSize) {
-        return;
-      }
-      const last = result.rows[result.rows.length - 1];
-      afterCleanupAt = last.cleanup_at;
-      afterId = last.id;
-    }
+  async completedRunsOldestFirst(): Promise<CompletedRunForCleanup[]> {
+    const result = await this.pool.query<CompletedRunForCleanup>(
+      `SELECT id,
+              worktree_path,
+              branch_name,
+              status
+       FROM ${this.table}
+       WHERE worktree_path IS NOT NULL
+         AND worktree_removed_at IS NULL
+         AND status IN ('succeeded', 'failed')
+       ORDER BY COALESCE(finished_at, updated_at, created_at) ASC, id ASC`,
+    );
+    return result.rows;
   }
 
   async recordedWorktreePaths(): Promise<string[]> {
@@ -388,14 +365,52 @@ export class AgentRunStore {
 }
 
 export function errorToJson(error: unknown): Record<string, unknown> {
-  if (error instanceof Error) {
-    return {
-      message: error.message,
-      name: error.name,
-      stack: error.stack,
-    };
+  const serialized = serializeErrorValue(error, new Set());
+  if (serialized && typeof serialized === "object" && !Array.isArray(serialized)) {
+    return serialized as Record<string, unknown>;
   }
-  return { message: String(error) };
+  return { message: String(serialized) };
+}
+
+function serializeErrorValue(value: unknown, seen: Set<object>): unknown {
+  if (value === null || value === undefined || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "bigint" || typeof value === "symbol" || typeof value === "function") {
+    return String(value);
+  }
+  if (typeof value !== "object") {
+    return String(value);
+  }
+  if (seen.has(value)) {
+    return "[Circular]";
+  }
+  seen.add(value);
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => serializeErrorValue(item, seen));
+  }
+
+  const output: Record<string, unknown> = {};
+  const isError = value instanceof Error;
+  if (isError) {
+    output.message = value.message;
+    output.name = value.name;
+    output.stack = value.stack;
+  }
+  for (const key of new Set([...Object.getOwnPropertyNames(value), ...Object.keys(value)])) {
+    if (isError && (key === "message" || key === "name" || key === "stack")) {
+      continue;
+    }
+    try {
+      output[key] = serializeErrorValue((value as Record<string, unknown>)[key], seen);
+    } catch {
+      output[key] = "[Unserializable]";
+    }
+  }
+  return output;
 }
 
 function errorMessage(error: unknown): string {

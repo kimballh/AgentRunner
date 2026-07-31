@@ -38,6 +38,8 @@ function serviceConfig(overrides: Partial<ServiceConfig>): ServiceConfig {
     numWorkers: 1,
     pollFrequencyMs: 60_000,
     staleAfterMs: 900_000,
+    preflightRetries: 2,
+    preflightRetryDelayMs: 0,
     host: "127.0.0.1",
     port: 0,
     git: {

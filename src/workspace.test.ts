@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { prepareWorkspace, runWorkspaceSetup, type WorkspaceCommandRunner } from "./workspace.js";
 import type { AgentRunRow, CompletedRunForCleanup, ServiceConfig } from "./types.js";
 
@@ -44,6 +44,26 @@ describe("workspace", () => {
     expect(workspace.branchName).toMatch(/^agentrunner\/har-42-42-/);
     expect(runner.commands.map((item) => item.command.join(" "))).toContain("git fetch origin");
     expect(runner.commands.some((item) => item.command.includes("worktree"))).toBe(true);
+  });
+
+  test("retries a transient Git fetch failure before creating the worktree", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const runner = recordingRunner({ transientFetchFailures: 2 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      await prepareWorkspace({
+        config: serviceConfig({ cwd, git: { ...gitConfig(), repo, baseBranch: "origin/main" } }),
+        run: row(),
+        completedRuns: [],
+        runner,
+      });
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(runner.commands.filter((item) => item.command.join(" ") === "git fetch origin")).toHaveLength(3);
   });
 
   test("missing upstream branch produces a clear error", async () => {
@@ -164,10 +184,13 @@ describe("workspace", () => {
   });
 });
 
-function recordingRunner(options: { defaultStdout?: string; worktreeList?: string } = {}): WorkspaceCommandRunner & {
+function recordingRunner(
+  options: { defaultStdout?: string; worktreeList?: string; transientFetchFailures?: number } = {},
+): WorkspaceCommandRunner & {
   commands: Array<{ command: string[]; cwd: string; label: string }>;
 } {
   const commands: Array<{ command: string[]; cwd: string; label: string }> = [];
+  let transientFetchFailures = options.transientFetchFailures ?? 0;
   return {
     commands,
     async run(command, runOptions) {
@@ -178,20 +201,21 @@ function recordingRunner(options: { defaultStdout?: string; worktreeList?: strin
       if (command.join(" ") === "git worktree list --porcelain") {
         return { exitCode: 0, stdout: options.worktreeList ?? "", stderr: "" };
       }
+      if (command.join(" ") === "git fetch origin" && transientFetchFailures > 0) {
+        transientFetchFailures--;
+        throw Object.assign(new Error("connection reset while fetching"), { code: "ECONNRESET" });
+      }
       return { exitCode: 0, stdout: "", stderr: "" };
     },
   };
 }
 
 function cleanupRow(id: number, worktreePath: string): CompletedRunForCleanup {
-  const completedAt = new Date(id * 1_000);
   return {
     id,
-    created_at: completedAt,
-    finished_at: completedAt,
-    cleanup_at: completedAt,
     worktree_path: worktreePath,
     branch_name: `agentrunner/run-${id}`,
+    status: "succeeded",
   };
 }
 
@@ -209,6 +233,8 @@ function serviceConfig(overrides: Partial<ServiceConfig>): ServiceConfig {
     numWorkers: 1,
     pollFrequencyMs: 60_000,
     staleAfterMs: 900_000,
+    preflightRetries: 2,
+    preflightRetryDelayMs: 0,
     host: "127.0.0.1",
     port: 0,
     git: gitConfig(),

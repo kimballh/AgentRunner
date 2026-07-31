@@ -10,6 +10,21 @@ export interface ProcessResult {
   exitCode: number;
 }
 
+export class CommandError extends Error {
+  constructor(
+    message: string,
+    readonly label: string,
+    readonly command: string[],
+    readonly cwd: string,
+    readonly exitCode: number,
+    readonly stdout: string,
+    readonly stderr: string,
+  ) {
+    super(message);
+    this.name = "CommandError";
+  }
+}
+
 export async function runProcess(command: string[], options: { cwd: string; stdin?: string }): Promise<ProcessResult> {
   const subprocess = spawn(command[0]!, command.slice(1), {
     cwd: options.cwd,
@@ -38,8 +53,14 @@ export async function runProcess(command: string[], options: { cwd: string; stdi
 export async function runCommandOrThrow(command: string[], options: { cwd: string; label: string }): Promise<ProcessResult> {
   const result = await runProcess(command, { cwd: options.cwd });
   if (result.exitCode !== 0) {
-    throw new Error(
+    throw new CommandError(
       `${options.label} failed with exit ${result.exitCode}: ${command.join(" ")}\n${result.stderr || result.stdout}`,
+      options.label,
+      command,
+      options.cwd,
+      result.exitCode,
+      result.stdout,
+      result.stderr,
     );
   }
   return result;

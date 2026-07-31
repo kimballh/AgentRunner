@@ -77,6 +77,8 @@ function testConfig(codexBin: string, cwd: string): ServiceConfig {
     numWorkers: 1,
     pollFrequencyMs: 1000,
     staleAfterMs: 15_000,
+    preflightRetries: 2,
+    preflightRetryDelayMs: 0,
     host: "127.0.0.1",
     port: 0,
     git: {

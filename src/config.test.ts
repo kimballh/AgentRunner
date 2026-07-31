@@ -66,6 +66,8 @@ describe("loadConfig", () => {
     expect(config.databaseSchema).toBe("public");
     expect(config.databaseTable).toBe("agent_runs");
     expect(config.git.createWorktrees).toBe("auto");
+    expect(config.preflightRetries).toBe(2);
+    expect(config.preflightRetryDelayMs).toBe(1_000);
   });
 
   test("loads git config and CLI overrides", async () => {
@@ -74,6 +76,7 @@ describe("loadConfig", () => {
       path.join(cwd, "agentrunner_config.toml"),
       [
         'database_url_env_var = "CUSTOM_DB_URL"',
+        "preflight_retries = 4",
         "[git]",
         'create_worktrees = "never"',
         'base_branch = "origin/dev"',
@@ -83,14 +86,16 @@ describe("loadConfig", () => {
       ].join("\n"),
     );
     process.env.CUSTOM_DB_URL = "postgres://from-custom/db";
+    process.env.AGENTRUNNER_PREFLIGHT_RETRIES = "3";
 
-    const config = await loadConfig({ createWorktrees: "always", maxWorktrees: "3" }, cwd);
+    const config = await loadConfig({ createWorktrees: "always", maxWorktrees: "3", preflightRetries: "5" }, cwd);
 
     expect(config.git.createWorktrees).toBe("always");
     expect(config.git.baseBranch).toBe("origin/dev");
     expect(config.git.worktreeDir).toBe(".custom-worktrees");
     expect(config.git.maxWorktrees).toBe(3);
     expect(config.git.setupScript).toBe("scripts/setup.sh");
+    expect(config.preflightRetries).toBe(5);
   });
 
   test("rejects mutually exclusive setup settings", async () => {

@@ -89,6 +89,8 @@ function addConfigOptions(command: Command): Command {
     .option("--poll-frequency <ms>", "Poll frequency in milliseconds")
     .option("--poll-frequency-ms <ms>", "Poll frequency in milliseconds")
     .option("--stale-after-ms <ms>", "Running job stale heartbeat threshold")
+    .option("--preflight-retries <count>", "Retries for transient preflight failures")
+    .option("--preflight-retry-delay-ms <ms>", "Base delay between preflight retries")
     .option("--host <host>", "Dashboard host")
     .option("--port <port>", "Dashboard port")
     .option("--create-worktrees <mode>", "auto, always, never, true, or false")
@@ -113,6 +115,8 @@ function toOverrides(options: Record<string, unknown>): ConfigOverrides {
     numWorkers: stringOption(options.numWorkers),
     pollFrequencyMs: stringOption(options.pollFrequencyMs) ?? stringOption(options.pollFrequency),
     staleAfterMs: stringOption(options.staleAfterMs),
+    preflightRetries: stringOption(options.preflightRetries),
+    preflightRetryDelayMs: stringOption(options.preflightRetryDelayMs),
     host: stringOption(options.host),
     port: stringOption(options.port),
     createWorktrees: stringOption(options.createWorktrees),

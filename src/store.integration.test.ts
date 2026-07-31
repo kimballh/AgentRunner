@@ -49,7 +49,7 @@ maybeDescribe("AgentRunStore integration", () => {
     expect(updated?.last_message).toBe("done");
   });
 
-  test("pages through cleanup candidates and excludes persisted removals", async () => {
+  test("returns all narrow cleanup candidates and excludes persisted removals", async () => {
     const inserted = await pool.query<{ id: number }>(
       `INSERT INTO "${schema}"."agent_runs"
        (status, raw_webhook_data, prompt, uid, created_at, finished_at, priority, worktree_path)
@@ -59,13 +59,13 @@ maybeDescribe("AgentRunStore integration", () => {
     );
     await store.markWorktreeRemoved(inserted.rows[0].id, "removed in test");
 
-    const candidates: number[] = [];
-    for await (const run of store.completedRunsOldestFirst(10)) {
-      candidates.push(run.id);
-    }
+    const candidateRows = await store.completedRunsOldestFirst();
+    const candidates = candidateRows.map((run) => run.id);
 
     expect(candidates).toHaveLength(104);
     expect(candidates).not.toContain(inserted.rows[0].id);
+    expect(candidateRows.every((run) => run.status === "succeeded")).toBe(true);
+    expect(Object.keys(candidateRows[0]).sort()).toEqual(["branch_name", "id", "status", "worktree_path"]);
     const removed = await store.getRun(inserted.rows[0].id);
     expect(removed?.worktree_removed_at).toBeInstanceOf(Date);
   });
@@ -85,6 +85,8 @@ function serviceConfig(url: string, databaseSchema: string): ServiceConfig {
     numWorkers: 1,
     pollFrequencyMs: 60_000,
     staleAfterMs: 900_000,
+    preflightRetries: 2,
+    preflightRetryDelayMs: 0,
     host: "127.0.0.1",
     port: 0,
     git: {

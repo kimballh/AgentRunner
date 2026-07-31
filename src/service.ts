@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { startDashboard, type DashboardServer } from "./dashboard.js";
 import { runAgent } from "./executors/index.js";
-import { AgentRunStore, errorToJson } from "./store.js";
+import { runPreflightPhase } from "./preflight.js";
+import { AgentRunStore } from "./store.js";
 import type { ExecutionResult, ServiceConfig, WorkerStats, WorkspaceResult } from "./types.js";
 import { prepareWorkspace, runWorkspaceSetup, WorkspaceSetupError } from "./workspace.js";
 
@@ -91,28 +92,46 @@ export class AgentRunnerService {
       try {
         const cleanupEnabled = this.config.git.maxWorktrees > 0;
         const completedRuns = cleanupEnabled
-          ? this.store.completedRunsOldestFirst(this.cleanupCandidatePageSize())
+          ? await this.preflightPhase(workerId, claimed.row.id, "load cleanup candidates (database)", () =>
+              this.store.completedRunsOldestFirst(),
+            )
           : [];
-        const recordedWorktreePaths = cleanupEnabled ? await this.store.recordedWorktreePaths() : [];
+        const recordedWorktreePaths = cleanupEnabled
+          ? await this.preflightPhase(workerId, claimed.row.id, "load recorded worktree paths (database)", () =>
+              this.store.recordedWorktreePaths(),
+            )
+          : [];
         workspace = await prepareWorkspace({
           config: this.config,
           run: claimed.row,
           completedRuns,
           recordedWorktreePaths,
-          onWorktreeRemoved: (id, note) => this.store.markWorktreeRemoved(id, note),
+          onWorktreeRemoved: (id, note) =>
+            this.preflightPhase(workerId, claimed.row.id, "persist worktree cleanup (database)", () =>
+              this.store.markWorktreeRemoved(id, note),
+            ),
         });
-        await this.store.recordWorkspace(claimed.row.id, workerId, workspace);
+        await this.preflightPhase(workerId, claimed.row.id, "persist workspace metadata (database)", () =>
+          this.store.recordWorkspace(claimed.row.id, workerId, workspace!),
+        );
 
         try {
-          const setupLogs = await runWorkspaceSetup(this.config, workspace);
+          const setupLogs = await this.preflightPhase(workerId, claimed.row.id, "workspace setup", () =>
+            runWorkspaceSetup(this.config, workspace!),
+          );
           if (setupLogs) {
             workspace.setupLogs = setupLogs;
-            await this.store.recordWorkspace(claimed.row.id, workerId, workspace);
+            await this.preflightPhase(workerId, claimed.row.id, "persist workspace setup logs (database)", () =>
+              this.store.recordWorkspace(claimed.row.id, workerId, workspace!),
+            );
           }
         } catch (error) {
-          if (error instanceof WorkspaceSetupError) {
-            workspace.setupLogs = error.setupLogs;
-            await this.store.recordWorkspace(claimed.row.id, workerId, workspace);
+          const setupError = findWorkspaceSetupError(error);
+          if (setupError) {
+            workspace.setupLogs = setupError.setupLogs;
+            await this.preflightPhase(workerId, claimed.row.id, "persist failed workspace setup logs (database)", () =>
+              this.store.recordWorkspace(claimed.row.id, workerId, workspace!),
+            );
           }
           throw error;
         }
@@ -140,7 +159,9 @@ export class AgentRunnerService {
         }
       } catch (error) {
         const result = workspace ? failureResultForWorkspace(workspace) : undefined;
-        await this.store.markFailed(claimed.row.id, workerId, claimed.row, errorToJson(error), result).catch((markError) => {
+        await this.preflightPhase(workerId, claimed.row.id, "persist run failure (database)", () =>
+          this.store.markFailed(claimed.row.id, workerId, claimed.row, error, result),
+        ).catch((markError) => {
           this.logWorkerError(workerId, `marking run ${claimed.row.id} failed`, markError);
         });
       } finally {
@@ -155,8 +176,18 @@ export class AgentRunnerService {
     console.warn(`Worker ${workerId} error while ${action}: ${errorMessage(error)}`);
   }
 
-  private cleanupCandidatePageSize(): number {
-    return Math.max(100, this.config.git.maxWorktrees * 2, this.config.git.maxWorktrees + this.config.git.cleanupBatchSize);
+  private preflightPhase<T>(workerId: string, runId: number, phase: string, operation: () => Promise<T>): Promise<T> {
+    return runPreflightPhase(phase, operation, {
+      retries: this.config.preflightRetries,
+      delayMs: this.config.preflightRetryDelayMs,
+      onRetry: (error, attempt, maxAttempts) => {
+        this.logWorkerError(
+          workerId,
+          `running preflight phase "${phase}" for run ${runId}; retrying after attempt ${attempt}/${maxAttempts}`,
+          error,
+        );
+      },
+    });
   }
 
   private sleep(ms: number): Promise<void> {
@@ -174,4 +205,17 @@ function failureResultForWorkspace(workspace: WorkspaceResult): ExecutionResult 
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function findWorkspaceSetupError(error: unknown): WorkspaceSetupError | undefined {
+  let current: unknown = error;
+  const seen = new Set<unknown>();
+  while (current && !seen.has(current)) {
+    if (current instanceof WorkspaceSetupError) {
+      return current;
+    }
+    seen.add(current);
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return undefined;
 }

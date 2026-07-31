@@ -73,7 +73,7 @@ CREATE INDEX IF NOT EXISTS agent_runs_created_at_id_idx
 DROP INDEX IF EXISTS ${schema}.agent_runs_completed_worktree_cleanup_idx;
 CREATE INDEX IF NOT EXISTS agent_runs_pending_worktree_cleanup_idx
     ON ${table} ((COALESCE(finished_at, updated_at, created_at)), id)
-    INCLUDE (worktree_path, branch_name)
+    INCLUDE (worktree_path, branch_name, status)
     WHERE worktree_path IS NOT NULL
       AND worktree_removed_at IS NULL
       AND status IN ('succeeded', 'failed');

@@ -86,6 +86,9 @@ Key settings:
   `AGENTRUNNER_DATABASE_URL`.
 - `num_workers`, `poll_frequency_ms`, `database_schema`, `database_table`,
   `host`, and `port`.
+- `preflight_retries` defaults to `2` retries for transient Git, database, and
+  system failures. `preflight_retry_delay_ms` defaults to `1000` and is used as
+  the base for linear backoff.
 - `[git]` controls execution workspaces. By default `create_worktrees = "auto"`
   creates isolated worktrees when AgentRunner starts inside a Git repo and keeps
   cwd execution outside Git repos.

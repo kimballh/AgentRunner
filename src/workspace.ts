@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
+import { runPreflightPhase } from "./preflight.js";
 import { runCommandOrThrow, runProcess, type ProcessResult } from "./process.js";
 import type { AgentRunRow, CompletedRunForCleanup, ServiceConfig, WorkspaceResult } from "./types.js";
 
@@ -24,37 +25,49 @@ export interface WorkspacePreparationInput {
 
 export async function prepareWorkspace(input: WorkspacePreparationInput): Promise<WorkspaceResult> {
   const runner = input.runner ?? defaultWorkspaceRunner;
-  const repo = await resolveRepo(input.config, runner);
+  const repo = await workspacePhase(input.config, "resolve Git repository", () => resolveRepo(input.config, runner));
   if (!repo.enabled) {
     return { cwd: input.config.cwd };
   }
 
-  const baseBranch = input.config.git.baseBranch ?? (await resolveUpstreamBranch(repo.root, runner));
+  const baseBranch =
+    input.config.git.baseBranch ??
+    (await workspacePhase(input.config, "resolve Git base branch", () => resolveUpstreamBranch(repo.root, runner)));
   const worktreeRoot = resolveConfiguredPath(input.config.git.worktreeDir, repo.root);
   const suffix = shortId();
   const runName = `${slugify(input.run.uid)}-${input.run.id}-${suffix}`;
   const branchName = `${input.config.git.branchPrefix}/${runName}`;
   const worktreePath = path.join(worktreeRoot, runName);
 
-  const cleanupNote = await cleanupOldWorktrees({
-    config: input.config,
-    repoRoot: repo.root,
-    worktreeRoot,
-    completedRuns: input.completedRuns,
-    recordedWorktreePaths: input.recordedWorktreePaths ?? [],
-    onWorktreeRemoved: input.onWorktreeRemoved,
-    runner,
-  });
+  const cleanupNote = await workspacePhase(
+    input.config,
+    "clean up old worktrees",
+    () =>
+      cleanupOldWorktrees({
+        config: input.config,
+        repoRoot: repo.root,
+        worktreeRoot,
+        completedRuns: input.completedRuns,
+        recordedWorktreePaths: input.recordedWorktreePaths ?? [],
+        onWorktreeRemoved: input.onWorktreeRemoved,
+        runner,
+      }),
+    0,
+  );
 
-  await fs.mkdir(worktreeRoot, { recursive: true });
-  await runner.run(["git", "fetch", input.config.git.remote], {
-    cwd: repo.root,
-    label: "fetch base branch",
-  });
-  await runner.run(["git", "worktree", "add", "-b", branchName, worktreePath, baseBranch], {
-    cwd: repo.root,
-    label: "create worktree",
-  });
+  await workspacePhase(input.config, "create worktree directory", () => fs.mkdir(worktreeRoot, { recursive: true }));
+  await workspacePhase(input.config, "fetch Git base branch", () =>
+    runner.run(["git", "fetch", input.config.git.remote], {
+      cwd: repo.root,
+      label: "fetch base branch",
+    }),
+  );
+  await workspacePhase(input.config, "create Git worktree", () =>
+    runner.run(["git", "worktree", "add", "-b", branchName, worktreePath, baseBranch], {
+      cwd: repo.root,
+      label: "create worktree",
+    }),
+  );
 
   return {
     cwd: worktreePath,
@@ -145,8 +158,8 @@ async function resolveUpstreamBranch(repoRoot: string, runner: WorkspaceCommandR
       cwd: repoRoot,
       label: "resolve upstream branch",
     });
-  } catch {
-    throw new Error("No upstream branch found; set [git].base_branch in agentrunner_config.toml");
+  } catch (error) {
+    throw new Error("No upstream branch found; set [git].base_branch in agentrunner_config.toml", { cause: error });
   }
   const branch = result.stdout.trim();
   if (!branch) {
@@ -243,18 +256,22 @@ async function removeCleanCandidates(
       dirty++;
       continue;
     }
-    await input.runner.run(["git", "worktree", "remove", candidate.path], {
-      cwd: input.repoRoot,
-      label: "remove old worktree",
-    });
+    await workspacePhase(input.config, "remove old Git worktree", () =>
+      input.runner.run(["git", "worktree", "remove", candidate.path], {
+        cwd: input.repoRoot,
+        label: "remove old worktree",
+      }),
+    );
     if (candidate.runId !== undefined) {
       await input.onWorktreeRemoved?.(candidate.runId, "worktree removed by cleanup");
     }
     if (input.config.git.cleanupDeleteBranches && candidate.branchName) {
-      await input.runner.run(["git", "branch", "-D", candidate.branchName], {
-        cwd: input.repoRoot,
-        label: "delete old worktree branch",
-      });
+      await workspacePhase(input.config, "delete old Git worktree branch", () =>
+        input.runner.run(["git", "branch", "-D", candidate.branchName!], {
+          cwd: input.repoRoot,
+          label: "delete old worktree branch",
+        }),
+      );
     }
     removed++;
   }
@@ -269,10 +286,12 @@ async function orphanedRegisteredWorktrees(input: {
   recordedWorktreePaths: Iterable<string>;
   runner: WorkspaceCommandRunner;
 }): Promise<CleanupCandidate[]> {
-  const listed = await input.runner.run(["git", "worktree", "list", "--porcelain"], {
-    cwd: input.repoRoot,
-    label: "list registered worktrees",
-  });
+  const listed = await workspacePhase(input.config, "list registered Git worktrees", () =>
+    input.runner.run(["git", "worktree", "list", "--porcelain"], {
+      cwd: input.repoRoot,
+      label: "list registered worktrees",
+    }),
+  );
   const recorded = new Set(Array.from(input.recordedWorktreePaths, (item) => path.resolve(item)));
   const branchPrefix = `refs/heads/${input.config.git.branchPrefix}/`;
   const graceCutoff = Date.now() - input.config.staleAfterMs;
@@ -388,4 +407,25 @@ async function pathExists(input: string): Promise<boolean> {
 
 function section(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function workspacePhase<T>(
+  config: ServiceConfig,
+  phase: string,
+  operation: () => Promise<T>,
+  retries = config.preflightRetries,
+): Promise<T> {
+  return runPreflightPhase(phase, operation, {
+    retries,
+    delayMs: config.preflightRetryDelayMs,
+    onRetry: (error, attempt, maxAttempts) => {
+      console.warn(
+        `Preflight phase "${phase}" failed on attempt ${attempt}/${maxAttempts}; retrying: ${errorMessage(error)}`,
+      );
+    },
+  });
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

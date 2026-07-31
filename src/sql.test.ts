@@ -15,6 +15,7 @@ describe("sql helpers", () => {
     expect(sql).toContain("agent_runs_status_priority_idx");
     expect(sql).toContain("agent_runs_created_at_id_idx");
     expect(sql).toContain("agent_runs_pending_worktree_cleanup_idx");
+    expect(sql).toContain("INCLUDE (worktree_path, branch_name, status)");
     expect(sql).toContain("worktree_removed_at IS NULL");
   });
 
