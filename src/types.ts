@@ -92,6 +92,7 @@ export interface AgentRunRow {
   base_branch?: string | null;
   setup_logs?: string | null;
   cleanup_note?: string | null;
+  worktree_removed_at?: Date | null;
 }
 
 export interface RunListItem {
@@ -128,6 +129,7 @@ export interface CompletedRunForCleanup {
   created_at: Date;
   finished_at: Date | null;
   updated_at?: Date | null;
+  cleanup_at: Date;
   worktree_path: string | null;
   branch_name?: string | null;
 }

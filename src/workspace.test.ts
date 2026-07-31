@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 import { prepareWorkspace, runWorkspaceSetup, type WorkspaceCommandRunner } from "./workspace.js";
-import type { AgentRunRow, ServiceConfig } from "./types.js";
+import type { AgentRunRow, CompletedRunForCleanup, ServiceConfig } from "./types.js";
 
 describe("workspace", () => {
   test("auto mode falls back to cwd outside git", async () => {
@@ -78,6 +78,78 @@ describe("workspace", () => {
     expect(runner.commands.map((item) => item.command.join(" "))).toContain(`git worktree remove ${old}`);
   });
 
+  test("cleanup reads past 100 missing paths and persists reconciliation state", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const root = path.join(repo, ".worktrees");
+    const oldOne = path.join(root, "old-one");
+    const oldTwo = path.join(root, "old-two");
+    await fs.mkdir(oldOne, { recursive: true });
+    await fs.mkdir(oldTwo, { recursive: true });
+    const runner = recordingRunner();
+    const marked: Array<{ id: number; note: string }> = [];
+    let pagesRead = 0;
+
+    async function* completedRuns(): AsyncGenerator<CompletedRunForCleanup> {
+      pagesRead++;
+      for (let id = 1; id <= 100; id++) {
+        yield cleanupRow(id, path.join(root, `already-removed-${id}`));
+      }
+      pagesRead++;
+      yield cleanupRow(101, oldOne);
+      yield cleanupRow(102, oldTwo);
+    }
+
+    await prepareWorkspace({
+      config: serviceConfig({ cwd, git: { ...gitConfig(), repo, maxWorktrees: 2, cleanupBatchSize: 1 } }),
+      run: row(),
+      completedRuns: completedRuns(),
+      onWorktreeRemoved: async (id, note) => {
+        marked.push({ id, note });
+      },
+      runner,
+    });
+
+    expect(pagesRead).toBe(2);
+    expect(marked.filter(({ note }) => note.includes("already absent"))).toHaveLength(100);
+    expect(marked).toContainEqual({ id: 101, note: "worktree removed by cleanup" });
+    expect(runner.commands.map((item) => item.command.join(" "))).toContain(`git worktree remove ${oldOne}`);
+  });
+
+  test("cleanup reconciles stale registered AgentRunner worktrees missing from the database", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const root = path.join(repo, ".worktrees");
+    const legacy = path.join(root, "legacy");
+    await fs.mkdir(legacy, { recursive: true });
+    const oldTimestamp = new Date(Date.now() - 60_000);
+    await fs.utimes(legacy, oldTimestamp, oldTimestamp);
+    const runner = recordingRunner({
+      worktreeList: [
+        `worktree ${repo}`,
+        "branch refs/heads/main",
+        "",
+        `worktree ${legacy}`,
+        "branch refs/heads/agentrunner/legacy",
+        "",
+      ].join("\n"),
+    });
+
+    await prepareWorkspace({
+      config: serviceConfig({
+        cwd,
+        staleAfterMs: 1_000,
+        git: { ...gitConfig(), repo, maxWorktrees: 1, cleanupBatchSize: 1 },
+      }),
+      run: row(),
+      completedRuns: [],
+      recordedWorktreePaths: [],
+      runner,
+    });
+
+    expect(runner.commands.map((item) => item.command.join(" "))).toContain(`git worktree remove ${legacy}`);
+  });
+
   test("auto setup uses .codex environment script when present", async () => {
     const cwd = await tempDir();
     await fs.mkdir(path.join(cwd, ".codex", "environments"), { recursive: true });
@@ -92,7 +164,7 @@ describe("workspace", () => {
   });
 });
 
-function recordingRunner(options: { defaultStdout?: string } = {}): WorkspaceCommandRunner & {
+function recordingRunner(options: { defaultStdout?: string; worktreeList?: string } = {}): WorkspaceCommandRunner & {
   commands: Array<{ command: string[]; cwd: string; label: string }>;
 } {
   const commands: Array<{ command: string[]; cwd: string; label: string }> = [];
@@ -103,8 +175,23 @@ function recordingRunner(options: { defaultStdout?: string } = {}): WorkspaceCom
       if (command.join(" ") === "git rev-parse --abbrev-ref --symbolic-full-name @{u}") {
         return { exitCode: 0, stdout: options.defaultStdout ?? "origin/main\n", stderr: "" };
       }
+      if (command.join(" ") === "git worktree list --porcelain") {
+        return { exitCode: 0, stdout: options.worktreeList ?? "", stderr: "" };
+      }
       return { exitCode: 0, stdout: "", stderr: "" };
     },
+  };
+}
+
+function cleanupRow(id: number, worktreePath: string): CompletedRunForCleanup {
+  const completedAt = new Date(id * 1_000);
+  return {
+    id,
+    created_at: completedAt,
+    finished_at: completedAt,
+    cleanup_at: completedAt,
+    worktree_path: worktreePath,
+    branch_name: `agentrunner/run-${id}`,
   };
 }
 

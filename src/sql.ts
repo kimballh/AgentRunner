@@ -45,6 +45,7 @@ CREATE INDEX IF NOT EXISTS index_uid
 }
 
 export function migrationSql(config: Pick<ServiceConfig, "databaseSchema" | "databaseTable">): string {
+  const schema = quoteIdentifier(config.databaseSchema);
   const table = qualifiedTable(config);
   return `${baseTableSql(config)}
 
@@ -61,6 +62,7 @@ ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS branch_name text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS base_branch text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS setup_logs text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS cleanup_note text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS worktree_removed_at timestamp;
 
 CREATE INDEX IF NOT EXISTS agent_runs_status_priority_idx
     ON ${table} (status, priority DESC, created_at ASC);
@@ -68,10 +70,13 @@ CREATE INDEX IF NOT EXISTS agent_runs_status_priority_idx
 CREATE INDEX IF NOT EXISTS agent_runs_created_at_id_idx
     ON ${table} (created_at DESC, id DESC);
 
-CREATE INDEX IF NOT EXISTS agent_runs_completed_worktree_cleanup_idx
-    ON ${table} ((COALESCE(finished_at, updated_at, created_at)))
-    INCLUDE (id, worktree_path, branch_name)
-    WHERE worktree_path IS NOT NULL AND status IN ('succeeded', 'failed');
+DROP INDEX IF EXISTS ${schema}.agent_runs_completed_worktree_cleanup_idx;
+CREATE INDEX IF NOT EXISTS agent_runs_pending_worktree_cleanup_idx
+    ON ${table} ((COALESCE(finished_at, updated_at, created_at)), id)
+    INCLUDE (worktree_path, branch_name)
+    WHERE worktree_path IS NOT NULL
+      AND worktree_removed_at IS NULL
+      AND status IN ('succeeded', 'failed');
 
 CREATE INDEX IF NOT EXISTS agent_runs_locked_at_idx
     ON ${table} (locked_at);`;

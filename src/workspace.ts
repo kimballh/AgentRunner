@@ -16,7 +16,9 @@ export const defaultWorkspaceRunner: WorkspaceCommandRunner = {
 export interface WorkspacePreparationInput {
   config: ServiceConfig;
   run: AgentRunRow;
-  completedRuns: CompletedRunForCleanup[];
+  completedRuns: Iterable<CompletedRunForCleanup> | AsyncIterable<CompletedRunForCleanup>;
+  recordedWorktreePaths?: Iterable<string>;
+  onWorktreeRemoved?: (id: number, note: string) => Promise<void>;
   runner?: WorkspaceCommandRunner;
 }
 
@@ -39,6 +41,8 @@ export async function prepareWorkspace(input: WorkspacePreparationInput): Promis
     repoRoot: repo.root,
     worktreeRoot,
     completedRuns: input.completedRuns,
+    recordedWorktreePaths: input.recordedWorktreePaths ?? [],
+    onWorktreeRemoved: input.onWorktreeRemoved,
     runner,
   });
 
@@ -155,36 +159,80 @@ async function cleanupOldWorktrees(input: {
   config: ServiceConfig;
   repoRoot: string;
   worktreeRoot: string;
-  completedRuns: CompletedRunForCleanup[];
+  completedRuns: Iterable<CompletedRunForCleanup> | AsyncIterable<CompletedRunForCleanup>;
+  recordedWorktreePaths: Iterable<string>;
+  onWorktreeRemoved?: (id: number, note: string) => Promise<void>;
   runner: WorkspaceCommandRunner;
 }): Promise<string | undefined> {
   if (input.config.git.maxWorktrees <= 0) {
     return undefined;
   }
 
-  const existing = [];
-  for (const run of input.completedRuns) {
-    if (run.worktree_path && isPathInside(run.worktree_path, input.worktreeRoot) && (await pathExists(run.worktree_path))) {
-      existing.push(run);
-    }
-  }
-  if (existing.length < input.config.git.maxWorktrees) {
-    return undefined;
-  }
-
+  const existing: CleanupCandidate[] = await orphanedRegisteredWorktrees(input);
+  let cleanupRequired = existing.length >= input.config.git.maxWorktrees;
+  let checked = 0;
   let removed = 0;
   let dirty = 0;
-  for (const run of existing) {
-    if (removed >= input.config.git.cleanupBatchSize) {
-      break;
-    }
+  for await (const run of input.completedRuns) {
     if (!run.worktree_path || !isPathInside(run.worktree_path, input.worktreeRoot)) {
       continue;
     }
+    if (!(await pathExists(run.worktree_path))) {
+      await input.onWorktreeRemoved?.(run.id, "worktree path was already absent during cleanup reconciliation");
+      continue;
+    }
+    existing.push({ path: run.worktree_path, branchName: run.branch_name ?? undefined, runId: run.id });
+    if (!cleanupRequired && existing.length >= input.config.git.maxWorktrees) {
+      cleanupRequired = true;
+    }
+    if (!cleanupRequired) {
+      continue;
+    }
+
+    ({ checked, removed, dirty } = await removeCleanCandidates(input, existing, checked, removed, dirty));
+    if (removed >= input.config.git.cleanupBatchSize) {
+      break;
+    }
+  }
+
+  if (!cleanupRequired) {
+    return undefined;
+  }
+
+  ({ checked, removed, dirty } = await removeCleanCandidates(input, existing, checked, removed, dirty));
+
+  if (removed === 0) {
+    return dirty > 0
+      ? `max_worktrees reached; no clean completed worktrees were available to remove (${dirty} dirty skipped)`
+      : "max_worktrees reached; no completed worktrees were available to remove";
+  }
+  return `max_worktrees reached; removed ${removed} old clean worktree${removed === 1 ? "" : "s"}`;
+}
+
+interface CleanupCandidate {
+  path: string;
+  branchName?: string;
+  runId?: number;
+}
+
+async function removeCleanCandidates(
+  input: {
+    config: ServiceConfig;
+    repoRoot: string;
+    runner: WorkspaceCommandRunner;
+    onWorktreeRemoved?: (id: number, note: string) => Promise<void>;
+  },
+  candidates: CleanupCandidate[],
+  checked: number,
+  removed: number,
+  dirty: number,
+): Promise<{ checked: number; removed: number; dirty: number }> {
+  while (checked < candidates.length && removed < input.config.git.cleanupBatchSize) {
+    const candidate = candidates[checked++];
     let status: ProcessResult;
     try {
       status = await input.runner.run(["git", "status", "--porcelain"], {
-        cwd: run.worktree_path,
+        cwd: candidate.path,
         label: "check worktree cleanliness",
       });
     } catch {
@@ -195,12 +243,15 @@ async function cleanupOldWorktrees(input: {
       dirty++;
       continue;
     }
-    await input.runner.run(["git", "worktree", "remove", run.worktree_path], {
+    await input.runner.run(["git", "worktree", "remove", candidate.path], {
       cwd: input.repoRoot,
       label: "remove old worktree",
     });
-    if (input.config.git.cleanupDeleteBranches && run.branch_name) {
-      await input.runner.run(["git", "branch", "-D", run.branch_name], {
+    if (candidate.runId !== undefined) {
+      await input.onWorktreeRemoved?.(candidate.runId, "worktree removed by cleanup");
+    }
+    if (input.config.git.cleanupDeleteBranches && candidate.branchName) {
+      await input.runner.run(["git", "branch", "-D", candidate.branchName], {
         cwd: input.repoRoot,
         label: "delete old worktree branch",
       });
@@ -208,12 +259,72 @@ async function cleanupOldWorktrees(input: {
     removed++;
   }
 
-  if (removed === 0) {
-    return dirty > 0
-      ? `max_worktrees reached; no clean completed worktrees were available to remove (${dirty} dirty skipped)`
-      : "max_worktrees reached; no completed worktrees were available to remove";
+  return { checked, removed, dirty };
+}
+
+async function orphanedRegisteredWorktrees(input: {
+  config: ServiceConfig;
+  repoRoot: string;
+  worktreeRoot: string;
+  recordedWorktreePaths: Iterable<string>;
+  runner: WorkspaceCommandRunner;
+}): Promise<CleanupCandidate[]> {
+  const listed = await input.runner.run(["git", "worktree", "list", "--porcelain"], {
+    cwd: input.repoRoot,
+    label: "list registered worktrees",
+  });
+  const recorded = new Set(Array.from(input.recordedWorktreePaths, (item) => path.resolve(item)));
+  const branchPrefix = `refs/heads/${input.config.git.branchPrefix}/`;
+  const graceCutoff = Date.now() - input.config.staleAfterMs;
+  const candidates: Array<CleanupCandidate & { modifiedAt: number }> = [];
+
+  for (const worktree of parseWorktreeList(listed.stdout)) {
+    const resolvedPath = path.resolve(worktree.path);
+    if (
+      recorded.has(resolvedPath) ||
+      !isPathInside(resolvedPath, input.worktreeRoot) ||
+      !worktree.branch?.startsWith(branchPrefix)
+    ) {
+      continue;
+    }
+    try {
+      const stat = await fs.stat(resolvedPath);
+      if (stat.mtimeMs > graceCutoff) {
+        continue;
+      }
+      candidates.push({
+        path: resolvedPath,
+        branchName: worktree.branch.slice("refs/heads/".length),
+        modifiedAt: stat.mtimeMs,
+      });
+    } catch {
+      // Missing registered worktrees are left for Git's own prune mechanism.
+    }
   }
-  return `max_worktrees reached; removed ${removed} old clean worktree${removed === 1 ? "" : "s"}`;
+
+  return candidates.sort((left, right) => left.modifiedAt - right.modifiedAt);
+}
+
+function parseWorktreeList(output: string): Array<{ path: string; branch?: string }> {
+  const worktrees: Array<{ path: string; branch?: string }> = [];
+  let current: { path: string; branch?: string } | undefined;
+  for (const line of output.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      if (current) {
+        worktrees.push(current);
+      }
+      current = { path: line.slice("worktree ".length) };
+    } else if (current && line.startsWith("branch ")) {
+      current.branch = line.slice("branch ".length);
+    } else if (current && line.length === 0) {
+      worktrees.push(current);
+      current = undefined;
+    }
+  }
+  if (current) {
+    worktrees.push(current);
+  }
+  return worktrees;
 }
 
 async function resolveSetupScript(

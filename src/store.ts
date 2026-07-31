@@ -121,17 +121,63 @@ export class AgentRunStore {
     return result.rows[0];
   }
 
-  async completedRunsOldestFirst(limit = 10_000): Promise<CompletedRunForCleanup[]> {
-    const result = await this.pool.query<CompletedRunForCleanup>(
-      `SELECT id, created_at, finished_at, updated_at, worktree_path, branch_name
+  async *completedRunsOldestFirst(pageSize = 100): AsyncGenerator<CompletedRunForCleanup> {
+    let afterCleanupAt: Date | undefined;
+    let afterId: number | undefined;
+
+    while (true) {
+      const result = await this.pool.query<CompletedRunForCleanup>(
+        `SELECT id,
+                created_at,
+                finished_at,
+                updated_at,
+                COALESCE(finished_at, updated_at, created_at) AS cleanup_at,
+                worktree_path,
+                branch_name
+         FROM ${this.table}
+         WHERE worktree_path IS NOT NULL
+           AND worktree_removed_at IS NULL
+           AND status IN ('succeeded', 'failed')
+           AND ($2::timestamp IS NULL OR (COALESCE(finished_at, updated_at, created_at), id) > ($2, $3))
+         ORDER BY COALESCE(finished_at, updated_at, created_at) ASC, id ASC
+         LIMIT $1`,
+        [pageSize, afterCleanupAt ?? null, afterId ?? null],
+      );
+      if (result.rows.length === 0) {
+        return;
+      }
+
+      for (const row of result.rows) {
+        yield row;
+      }
+      if (result.rows.length < pageSize) {
+        return;
+      }
+      const last = result.rows[result.rows.length - 1];
+      afterCleanupAt = last.cleanup_at;
+      afterId = last.id;
+    }
+  }
+
+  async recordedWorktreePaths(): Promise<string[]> {
+    const result = await this.pool.query<{ worktree_path: string }>(
+      `SELECT worktree_path
        FROM ${this.table}
        WHERE worktree_path IS NOT NULL
-         AND status IN ('succeeded', 'failed')
-       ORDER BY COALESCE(finished_at, updated_at, created_at) ASC
-       LIMIT $1`,
-      [limit],
+         AND worktree_removed_at IS NULL`,
     );
-    return result.rows;
+    return result.rows.map((row) => row.worktree_path);
+  }
+
+  async markWorktreeRemoved(id: number, note: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE ${this.table}
+       SET worktree_removed_at = COALESCE(worktree_removed_at, NOW()),
+           cleanup_note = COALESCE(cleanup_note, $2),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [id, note],
+    );
   }
 
   async recoverStaleRuns(): Promise<number> {
@@ -239,6 +285,7 @@ export class AgentRunStore {
            base_branch = $6,
            setup_logs = COALESCE($7, setup_logs),
            cleanup_note = COALESCE($8, cleanup_note),
+           worktree_removed_at = NULL,
            updated_at = NOW()
        WHERE id = $1 AND locked_by = $2`,
       [

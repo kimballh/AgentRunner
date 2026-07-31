@@ -4,12 +4,35 @@ Postgres-backed local agent job runner for Codex and Claude Code.
 
 ## Setup
 
+Requires Node.js 20 or newer.
+
+Install dependencies and build the CLI:
+
 ```bash
 npm install
 npm run build
 ```
 
-Create a local `.env` in the project where you run the service:
+To link the current source checkout globally:
+
+```bash
+npm link
+```
+
+This exposes the `agentrunner` command on your `PATH`. Because the global
+command points at `./dist/cli.js`, run `npm run build` again after changing the
+TypeScript source.
+
+If you prefer installing a global copy instead of a symlink, run:
+
+```bash
+npm install --global .
+```
+
+## Use in a Project
+
+From any project where you want AgentRunner to manage jobs, create a local
+`.env`:
 
 ```bash
 AGENTRUNNER_DATABASE_URL=postgres://user:password@host/db
@@ -18,20 +41,28 @@ AGENTRUNNER_DATABASE_URL=postgres://user:password@host/db
 Optional project config lives at `./agentrunner_config.toml`; see
 `agentrunner_config.example.toml`.
 
+Then initialize and run AgentRunner from that project directory:
+
+```bash
+agentrunner setup-db
+agentrunner check
+agentrunner run
+```
+
 ## Commands
 
 ```bash
-npm run dev -- print-ddl
-npm run dev -- setup-db
-npm run dev -- check
-npm run dev -- run
+agentrunner print-ddl
+agentrunner setup-db
+agentrunner check
+agentrunner run
 ```
 
 If an existing table is incompatible and setup cannot migrate it cleanly, you can
 drop and recreate the configured table after the first setup failure:
 
 ```bash
-npm run dev -- setup-db --force
+agentrunner setup-db --force
 ```
 
 After `run` starts, it prints a local dashboard URL:
@@ -65,7 +96,7 @@ default model and reasoning effort.
 CLI args use the same names with dashes, for example:
 
 ```bash
-npm run dev -- run \
+agentrunner run \
   --agent-provider both \
   --default-agent-provider codex \
   --num-workers 2 \
@@ -75,7 +106,7 @@ npm run dev -- run \
 Worktree options can be set in TOML or overridden on the CLI:
 
 ```bash
-npm run dev -- run \
+agentrunner run \
   --create-worktrees auto \
   --base-branch origin/main \
   --worktree-dir .worktrees \
@@ -94,3 +125,12 @@ Codex or Claude inside that worktree. Setup defaults to `[setup].script` in
 for locking, heartbeats, result JSON, exit codes, and workspace metadata.
 Workers claim jobs with `FOR UPDATE SKIP LOCKED` from rows whose status is
 `queued` or `retry`, ordered by `priority desc, created_at asc`.
+
+## Development
+
+When working inside this repository, you can run the TypeScript entrypoint
+without rebuilding:
+
+```bash
+npm run dev -- run
+```

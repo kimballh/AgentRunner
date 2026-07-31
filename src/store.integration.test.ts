@@ -48,6 +48,27 @@ maybeDescribe("AgentRunStore integration", () => {
     expect(updated?.status).toBe("succeeded");
     expect(updated?.last_message).toBe("done");
   });
+
+  test("pages through cleanup candidates and excludes persisted removals", async () => {
+    const inserted = await pool.query<{ id: number }>(
+      `INSERT INTO "${schema}"."agent_runs"
+       (status, raw_webhook_data, prompt, uid, created_at, finished_at, priority, worktree_path)
+       SELECT 'succeeded', '{}'::jsonb, 'cleanup', 'cleanup-' || value, NOW(), NOW(), 0, '/tmp/worktree-' || value
+       FROM generate_series(1, 105) AS value
+       RETURNING id`,
+    );
+    await store.markWorktreeRemoved(inserted.rows[0].id, "removed in test");
+
+    const candidates: number[] = [];
+    for await (const run of store.completedRunsOldestFirst(10)) {
+      candidates.push(run.id);
+    }
+
+    expect(candidates).toHaveLength(104);
+    expect(candidates).not.toContain(inserted.rows[0].id);
+    const removed = await store.getRun(inserted.rows[0].id);
+    expect(removed?.worktree_removed_at).toBeInstanceOf(Date);
+  });
 });
 
 function serviceConfig(url: string, databaseSchema: string): ServiceConfig {

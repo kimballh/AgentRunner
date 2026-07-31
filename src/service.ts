@@ -89,14 +89,17 @@ export class AgentRunnerService {
 
       let workspace: WorkspaceResult | undefined;
       try {
-        const completedRuns =
-          this.config.git.maxWorktrees > 0
-            ? await this.store.completedRunsOldestFirst(this.cleanupCandidateLimit())
-            : [];
+        const cleanupEnabled = this.config.git.maxWorktrees > 0;
+        const completedRuns = cleanupEnabled
+          ? this.store.completedRunsOldestFirst(this.cleanupCandidatePageSize())
+          : [];
+        const recordedWorktreePaths = cleanupEnabled ? await this.store.recordedWorktreePaths() : [];
         workspace = await prepareWorkspace({
           config: this.config,
           run: claimed.row,
           completedRuns,
+          recordedWorktreePaths,
+          onWorktreeRemoved: (id, note) => this.store.markWorktreeRemoved(id, note),
         });
         await this.store.recordWorkspace(claimed.row.id, workerId, workspace);
 
@@ -152,7 +155,7 @@ export class AgentRunnerService {
     console.warn(`Worker ${workerId} error while ${action}: ${errorMessage(error)}`);
   }
 
-  private cleanupCandidateLimit(): number {
+  private cleanupCandidatePageSize(): number {
     return Math.max(100, this.config.git.maxWorktrees * 2, this.config.git.maxWorktrees + this.config.git.cleanupBatchSize);
   }
 
