@@ -44,7 +44,48 @@ describe("workspace", () => {
     expect(workspace.baseBranch).toBe("origin/main");
     expect(workspace.branchName).toMatch(/^agentrunner\/har-42-42-/);
     expect(runner.commands.map((item) => item.command.join(" "))).toContain("git fetch origin");
-    expect(runner.commands.some((item) => item.command.includes("worktree"))).toBe(true);
+    const commands = runner.commands.map((item) => item.command.join(" "));
+    expect(commands.findIndex((command) => command === "git fetch origin")).toBeLessThan(
+      commands.findIndex((command) => command.startsWith("git worktree add ")),
+    );
+  });
+
+  test("queued base branch overrides the configured base after fetching its remote", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const runner = recordingRunner();
+
+    const workspace = await prepareWorkspace({
+      config: serviceConfig({ cwd, git: { ...gitConfig(), repo, baseBranch: "origin/main" } }),
+      run: row({ id: 72, uid: "HAR-72", base_branch: "origin/project/workflow-automation" }),
+      completedRuns: [],
+      runner,
+    });
+
+    expect(workspace.baseBranch).toBe("origin/project/workflow-automation");
+    expect(runner.commands.map((item) => item.command.join(" "))).toEqual(
+      expect.arrayContaining([
+        "git fetch origin",
+        expect.stringMatching(
+          /^git worktree add -b agentrunner\/har-72-72-[a-zA-Z0-9]+ .* origin\/project\/workflow-automation$/,
+        ),
+      ]),
+    );
+  });
+
+  test("blank queued base branch falls back to the configured base branch", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const runner = recordingRunner();
+
+    const workspace = await prepareWorkspace({
+      config: serviceConfig({ cwd, git: { ...gitConfig(), repo, baseBranch: "origin/main" } }),
+      run: row({ base_branch: "  " }),
+      completedRuns: [],
+      runner,
+    });
+
+    expect(workspace.baseBranch).toBe("origin/main");
   });
 
   test("retries a transient Git fetch failure before creating the worktree", async () => {
