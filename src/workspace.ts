@@ -30,9 +30,7 @@ export async function prepareWorkspace(input: WorkspacePreparationInput): Promis
     return { cwd: input.config.cwd };
   }
 
-  const baseBranch =
-    input.config.git.baseBranch ??
-    (await workspacePhase(input.config, "resolve Git base branch", () => resolveUpstreamBranch(repo.root, runner)));
+  const requestedBaseBranch = input.run.base_branch?.trim() || input.config.git.baseBranch;
   const worktreeRoot = resolveConfiguredPath(input.config.git.worktreeDir, repo.root);
   const suffix = shortId();
   const runName = `${slugify(input.run.uid)}-${input.run.id}-${suffix}`;
@@ -62,6 +60,9 @@ export async function prepareWorkspace(input: WorkspacePreparationInput): Promis
       label: "fetch base branch",
     }),
   );
+  const baseBranch =
+    requestedBaseBranch ??
+    (await workspacePhase(input.config, "resolve Git base branch", () => resolveUpstreamBranch(repo.root, runner)));
   await workspacePhase(input.config, "create Git worktree", () =>
     runner.run(["git", "worktree", "add", "-b", branchName, worktreePath, baseBranch], {
       cwd: repo.root,

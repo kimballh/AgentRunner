@@ -117,8 +117,11 @@ agentrunner run \
 ```
 
 When worktrees are enabled, AgentRunner fetches the configured remote, creates a
-per-run branch and worktree from the base branch, runs setup, then executes
-Codex or Claude inside that worktree. Setup defaults to `[setup].script` in
+per-run branch and worktree from the queued row's `base_branch` when present (or
+the configured/upstream base branch otherwise), runs setup, then executes Codex
+or Claude inside that worktree. Remote-tracking bases such as
+`origin/project/workflow-automation` are therefore refreshed before each
+worktree is created. Setup defaults to `[setup].script` in
 `.codex/environments/environment.toml` when present. You can override it with
 `[git].setup_script`, `[git].setup_command`, or disable it with `--no-setup`.
 
