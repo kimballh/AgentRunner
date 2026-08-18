@@ -19,6 +19,11 @@ export interface WorkspacePreparationInput {
   run: AgentRunRow;
   completedRuns: Iterable<CompletedRunForCleanup> | AsyncIterable<CompletedRunForCleanup>;
   recordedWorktreePaths?: Iterable<string>;
+  loadCleanupState?: () => Promise<{
+    completedRuns: Iterable<CompletedRunForCleanup> | AsyncIterable<CompletedRunForCleanup>;
+    recordedWorktreePaths: Iterable<string>;
+  }>;
+  withCleanupLock?: <T>(repoRoot: string, operation: () => Promise<T>) => Promise<T>;
   onWorktreeRemoved?: (id: number, note: string) => Promise<void>;
   runner?: WorkspaceCommandRunner;
 }
@@ -39,21 +44,32 @@ export async function prepareWorkspace(input: WorkspacePreparationInput): Promis
   const branchName = `${input.config.git.branchPrefix}/${runName}`;
   const worktreePath = path.join(worktreeRoot, runName);
 
-  const cleanupNote = await workspacePhase(
-    input.config,
-    "clean up old worktrees",
-    () =>
-      cleanupOldWorktrees({
-        config: input.config,
-        repoRoot: repo.root,
-        worktreeRoot,
-        completedRuns: input.completedRuns,
-        recordedWorktreePaths: input.recordedWorktreePaths ?? [],
-        onWorktreeRemoved: input.onWorktreeRemoved,
-        runner,
-      }),
-    0,
-  );
+  const cleanUp = async (): Promise<string | undefined> => {
+    const cleanupState = input.loadCleanupState
+      ? await input.loadCleanupState()
+      : {
+          completedRuns: input.completedRuns,
+          recordedWorktreePaths: input.recordedWorktreePaths ?? [],
+        };
+    return workspacePhase(
+      input.config,
+      "clean up old worktrees",
+      () =>
+        cleanupOldWorktrees({
+          config: input.config,
+          repoRoot: repo.root,
+          worktreeRoot,
+          completedRuns: cleanupState.completedRuns,
+          recordedWorktreePaths: cleanupState.recordedWorktreePaths,
+          onWorktreeRemoved: input.onWorktreeRemoved,
+          runner,
+        }),
+      0,
+    );
+  };
+  const cleanupNote = input.withCleanupLock
+    ? await input.withCleanupLock(repo.root, cleanUp)
+    : await cleanUp();
 
   await workspacePhase(input.config, "create worktree directory", () => fs.mkdir(worktreeRoot, { recursive: true }));
   await workspacePhase(input.config, "fetch Git base branch", () =>
@@ -256,12 +272,30 @@ async function removeCleanCandidates(
       dirty++;
       continue;
     }
-    await workspacePhase(input.config, "remove old Git worktree", () =>
-      input.runner.run(["git", "worktree", "remove", candidate.path], {
-        cwd: input.repoRoot,
-        label: "remove old worktree",
-      }),
-    );
+    try {
+      await workspacePhase(input.config, "remove old Git worktree", () =>
+        input.runner.run(["git", "worktree", "remove", candidate.path], {
+          cwd: input.repoRoot,
+          label: "remove old worktree",
+        }),
+      );
+    } catch (error) {
+      if (!(await pathExists(candidate.path))) {
+        if (candidate.runId !== undefined) {
+          await input.onWorktreeRemoved?.(
+            candidate.runId,
+            "worktree disappeared during concurrent cleanup reconciliation",
+          );
+        }
+        removed++;
+        continue;
+      }
+      if (isMissingWorktreeMetadataError(error) && !(await pathExists(path.join(candidate.path, ".git")))) {
+        dirty++;
+        continue;
+      }
+      throw error;
+    }
     if (candidate.runId !== undefined) {
       await input.onWorktreeRemoved?.(candidate.runId, "worktree removed by cleanup");
     }
@@ -400,9 +434,31 @@ async function pathExists(input: string): Promise<boolean> {
   try {
     await fs.stat(input);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return false;
+    }
+    throw error;
   }
+}
+
+function isMissingWorktreeMetadataError(error: unknown): boolean {
+  let current: unknown = error;
+  const seen = new Set<unknown>();
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    if (typeof current !== "object") {
+      return /\.git.*does not exist|not a working tree/i.test(String(current));
+    }
+    const record = current as Record<string, unknown>;
+    const diagnostics = [record.message, record.stderr].filter((value): value is string => typeof value === "string");
+    if (diagnostics.some((value) => /\.git.*does not exist|not a working tree/i.test(value))) {
+      return true;
+    }
+    current = record.cause;
+  }
+  return false;
 }
 
 function section(value: unknown): Record<string, unknown> {

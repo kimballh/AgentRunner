@@ -69,6 +69,29 @@ maybeDescribe("AgentRunStore integration", () => {
     const removed = await store.getRun(inserted.rows[0].id);
     expect(removed?.worktree_removed_at).toBeInstanceOf(Date);
   });
+
+  test("serializes cleanup locks across store instances", async () => {
+    const secondStore = new AgentRunStore(config);
+    let active = 0;
+    let maxActive = 0;
+    const operation = async (): Promise<void> => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      active--;
+    };
+
+    try {
+      await Promise.all([
+        store.withWorktreeCleanupLock("/tmp/shared-repo", operation),
+        secondStore.withWorktreeCleanupLock("/tmp/shared-repo", operation),
+      ]);
+    } finally {
+      await secondStore.close();
+    }
+
+    expect(maxActive).toBe(1);
+  });
 });
 
 function serviceConfig(url: string, databaseSchema: string): ServiceConfig {
