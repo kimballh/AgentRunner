@@ -91,21 +91,33 @@ export class AgentRunnerService {
       let workspace: WorkspaceResult | undefined;
       try {
         const cleanupEnabled = this.config.git.maxWorktrees > 0;
-        const completedRuns = cleanupEnabled
-          ? await this.preflightPhase(workerId, claimed.row.id, "load cleanup candidates (database)", () =>
-              this.store.completedRunsOldestFirst(),
-            )
-          : [];
-        const recordedWorktreePaths = cleanupEnabled
-          ? await this.preflightPhase(workerId, claimed.row.id, "load recorded worktree paths (database)", () =>
-              this.store.recordedWorktreePaths(),
-            )
-          : [];
         workspace = await prepareWorkspace({
           config: this.config,
           run: claimed.row,
-          completedRuns,
-          recordedWorktreePaths,
+          completedRuns: [],
+          loadCleanupState: cleanupEnabled
+            ? async () => {
+                const completedRuns = await this.preflightPhase(
+                  workerId,
+                  claimed.row.id,
+                  "load cleanup candidates (database)",
+                  () => this.store.completedRunsOldestFirst(),
+                );
+                const recordedWorktreePaths = await this.preflightPhase(
+                  workerId,
+                  claimed.row.id,
+                  "load recorded worktree paths (database)",
+                  () => this.store.recordedWorktreePaths(),
+                );
+                return { completedRuns, recordedWorktreePaths };
+              }
+            : undefined,
+          withCleanupLock: cleanupEnabled
+            ? (repoRoot, operation) =>
+                this.preflightPhase(workerId, claimed.row.id, "acquire worktree cleanup lock (database)", () =>
+                  this.store.withWorktreeCleanupLock(repoRoot, operation),
+                )
+            : undefined,
           onWorktreeRemoved: (id, note) =>
             this.preflightPhase(workerId, claimed.row.id, "persist worktree cleanup (database)", () =>
               this.store.markWorktreeRemoved(id, note),

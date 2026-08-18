@@ -31,6 +31,7 @@ export interface RunListPage {
 export class AgentRunStore {
   private readonly pool: Pool;
   private readonly table: string;
+  private readonly localCleanupLocks = new Map<string, Promise<void>>();
 
   constructor(private readonly config: ServiceConfig) {
     this.pool = new Pool({ connectionString: config.databaseUrl });
@@ -144,6 +145,25 @@ export class AgentRunStore {
          AND worktree_removed_at IS NULL`,
     );
     return result.rows.map((row) => row.worktree_path);
+  }
+
+  async withWorktreeCleanupLock<T>(repoRoot: string, operation: () => Promise<T>): Promise<T> {
+    const lockName = `agentrunner:worktree-cleanup:${repoRoot}`;
+    return this.withLocalCleanupLock(lockName, async () => {
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))", [lockName]);
+        const result = await operation();
+        await client.query("COMMIT");
+        return result;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+    });
   }
 
   async markWorktreeRemoved(id: number, note: string): Promise<void> {
@@ -361,6 +381,26 @@ export class AgentRunStore {
        WHERE id = $1`,
       [row.id, JSON.stringify(errorToJson(error))],
     );
+  }
+
+  private async withLocalCleanupLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.localCleanupLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.localCleanupLocks.set(key, tail);
+
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.localCleanupLocks.get(key) === tail) {
+        this.localCleanupLocks.delete(key);
+      }
+    }
   }
 }
 

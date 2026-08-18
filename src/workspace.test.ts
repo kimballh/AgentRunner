@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
+import { CommandError } from "./process.js";
 import { prepareWorkspace, runWorkspaceSetup, type WorkspaceCommandRunner } from "./workspace.js";
 import type { AgentRunRow, CompletedRunForCleanup, ServiceConfig } from "./types.js";
 
@@ -96,6 +97,152 @@ describe("workspace", () => {
     });
 
     expect(runner.commands.map((item) => item.command.join(" "))).toContain(`git worktree remove ${old}`);
+  });
+
+  test("serialized cleanup reloads candidates after acquiring the lock", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const root = path.join(repo, ".worktrees");
+    const oldOne = path.join(root, "old-one");
+    const oldTwo = path.join(root, "old-two");
+    await fs.mkdir(oldOne, { recursive: true });
+    await fs.mkdir(oldTwo, { recursive: true });
+    const runner = recordingRunner();
+    const runCommand = runner.run.bind(runner);
+    runner.run = async (command, options) => {
+      const result = await runCommand(command, options);
+      if (command[0] === "git" && command[1] === "worktree" && command[2] === "remove") {
+        await fs.rm(command[3]!, { recursive: true });
+      }
+      return result;
+    };
+
+    const remaining = new Map([
+      [1, cleanupRow(1, oldOne)],
+      [2, cleanupRow(2, oldTwo)],
+    ]);
+    let lockTail = Promise.resolve();
+    let activeLocks = 0;
+    let maxActiveLocks = 0;
+    async function withCleanupLock<T>(_repoRoot: string, operation: () => Promise<T>): Promise<T> {
+      const previous = lockTail;
+      let release!: () => void;
+      lockTail = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      activeLocks++;
+      maxActiveLocks = Math.max(maxActiveLocks, activeLocks);
+      try {
+        return await operation();
+      } finally {
+        activeLocks--;
+        release();
+      }
+    }
+    const input = (runId: number) => ({
+      config: serviceConfig({ cwd, git: { ...gitConfig(), repo, maxWorktrees: 1, cleanupBatchSize: 1 } }),
+      run: row({ id: runId, uid: `HAR-${runId}` }),
+      completedRuns: [],
+      loadCleanupState: async () => ({
+        completedRuns: [...remaining.values()],
+        recordedWorktreePaths: [...remaining.values()].map((run) => run.worktree_path!),
+      }),
+      withCleanupLock,
+      onWorktreeRemoved: async (id: number) => {
+        remaining.delete(id);
+      },
+      runner,
+    });
+
+    await Promise.all([prepareWorkspace(input(100)), prepareWorkspace(input(101))]);
+
+    expect(maxActiveLocks).toBe(1);
+    expect(remaining.size).toBe(0);
+    expect(
+      runner.commands
+        .filter((item) => item.command.slice(0, 3).join(" ") === "git worktree remove")
+        .map((item) => item.command[3]),
+    ).toEqual([oldOne, oldTwo]);
+  });
+
+  test("cleanup reconciles a candidate removed concurrently after the path check", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const root = path.join(repo, ".worktrees");
+    const old = path.join(root, "old");
+    await fs.mkdir(old, { recursive: true });
+    const runner = recordingRunner();
+    const runCommand = runner.run.bind(runner);
+    runner.run = async (command, options) => {
+      const result = await runCommand(command, options);
+      if (command.join(" ") === `git worktree remove ${old}`) {
+        await fs.rm(old, { recursive: true });
+        throw new CommandError(
+          "worktree metadata disappeared",
+          options.label,
+          command,
+          options.cwd,
+          128,
+          "",
+          `fatal: validation failed, cannot remove working tree: '${old}/.git' does not exist`,
+        );
+      }
+      return result;
+    };
+    const marked: Array<{ id: number; note: string }> = [];
+
+    const workspace = await prepareWorkspace({
+      config: serviceConfig({ cwd, git: { ...gitConfig(), repo, maxWorktrees: 1, cleanupBatchSize: 1 } }),
+      run: row({ id: 100 }),
+      completedRuns: [cleanupRow(1, old)],
+      onWorktreeRemoved: async (id, note) => {
+        marked.push({ id, note });
+      },
+      runner,
+    });
+
+    expect(workspace.cleanupNote).toContain("removed 1 old clean worktree");
+    expect(marked).toEqual([
+      { id: 1, note: "worktree disappeared during concurrent cleanup reconciliation" },
+    ]);
+    expect(runner.commands.map((item) => item.command.join(" "))).toContain("git fetch origin");
+  });
+
+  test("cleanup skips a broken candidate whose directory remains without Git metadata", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const root = path.join(repo, ".worktrees");
+    const old = path.join(root, "old");
+    await fs.mkdir(old, { recursive: true });
+    const runner = recordingRunner();
+    const runCommand = runner.run.bind(runner);
+    runner.run = async (command, options) => {
+      const result = await runCommand(command, options);
+      if (command.join(" ") === `git worktree remove ${old}`) {
+        throw new CommandError(
+          "worktree metadata is missing",
+          options.label,
+          command,
+          options.cwd,
+          128,
+          "",
+          `fatal: validation failed, cannot remove working tree: '${old}/.git' does not exist`,
+        );
+      }
+      return result;
+    };
+
+    const workspace = await prepareWorkspace({
+      config: serviceConfig({ cwd, git: { ...gitConfig(), repo, maxWorktrees: 1, cleanupBatchSize: 1 } }),
+      run: row({ id: 100 }),
+      completedRuns: [cleanupRow(1, old)],
+      runner,
+    });
+
+    expect(workspace.cleanupNote).toContain("no clean completed worktrees");
+    expect(workspace.cleanupNote).toContain("1 dirty skipped");
+    expect(runner.commands.map((item) => item.command.join(" "))).toContain("git fetch origin");
   });
 
   test("cleanup reads past 100 missing paths and persists reconciliation state", async () => {
