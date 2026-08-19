@@ -3,7 +3,7 @@ import type { ExecutionInput, ExecutionResult } from "../types.js";
 
 export async function runClaude(input: ExecutionInput): Promise<ExecutionResult> {
   const command = claudeCommand(input);
-  const result = await runProcess(command, { cwd: input.cwd, stdin: input.prompt });
+  const result = await runProcess(command, { cwd: input.cwd, stdin: input.prompt, signal: input.signal });
   const parsed = parseClaudeOutput(result.stdout);
   const sessionId = sessionIdFrom(parsed) ?? input.sessionId;
   const logs = [`--- stdout ---\n${result.stdout}`, `--- stderr ---\n${result.stderr}`].join("\n");
