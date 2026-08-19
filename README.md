@@ -132,6 +132,20 @@ for locking, heartbeats, result JSON, exit codes, and workspace metadata.
 Workers claim jobs with `FOR UPDATE SKIP LOCKED` from rows whose status is
 `queued` or `retry`, ordered by `priority desc, created_at asc`.
 
+Set a queued row's `reuse_session` column to `true` to request best-effort
+continuation of the newest successful run with the same `uid`. AgentRunner only
+reuses a retained provider session whose Git worktree still exists and is
+registered. It inherits the provider, mode, model, and reasoning effort from
+that session, fetches the configured remote, and fast-forwards the checked-out
+branch only when the worktree is clean and has an upstream. Workspace setup is
+skipped so the retained environment remains intact.
+
+Reuse is opportunistic. Missing sessions, removed or invalid worktrees, and
+concurrent use of the same session fall back to a fresh worktree and session.
+The row records the result in `session_id`, `reused_from_run_id`, and
+`reuse_fallback_reason`. A partial unique index prevents two active jobs from
+resuming the same session concurrently.
+
 ## Development
 
 When working inside this repository, you can run the TypeScript entrypoint

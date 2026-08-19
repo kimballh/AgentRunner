@@ -226,6 +226,8 @@ function runRow(run: RunListItem): string {
       <div><code>${escapeHtml(run.branch_name ?? "")}</code></div>
       <div class="muted">${escapeHtml(run.base_branch ?? "")}</div>
       <div><code>${escapeHtml(run.worktree_path ?? run.repo_path ?? "")}</code></div>
+      ${run.reused_from_run_id ? `<div>Reused session from <code>#${run.reused_from_run_id}</code></div>` : ""}
+      ${run.reuse_fallback_reason ? `<div class="muted">Fresh fallback: ${escapeHtml(run.reuse_fallback_reason)}</div>` : ""}
       ${run.cleanup_note ? `<div>${escapeHtml(run.cleanup_note)}</div>` : ""}
     </td>
     <td>

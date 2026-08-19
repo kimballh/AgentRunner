@@ -95,6 +95,15 @@ export interface AgentRunRow {
   setup_logs?: string | null;
   cleanup_note?: string | null;
   worktree_removed_at?: Date | null;
+  reuse_session?: boolean;
+  session_id?: string | null;
+  reused_from_run_id?: number | null;
+  reuse_fallback_reason?: string | null;
+  requested_agent_provider?: string | null;
+  requested_agent_mode?: string | null;
+  requested_model_name?: string | null;
+  requested_reasoning_effort?: string | null;
+  requested_base_branch?: string | null;
 }
 
 export interface RunListItem {
@@ -120,6 +129,10 @@ export interface RunListItem {
   branch_name?: string | null;
   base_branch?: string | null;
   cleanup_note?: string | null;
+  reuse_session?: boolean;
+  session_id?: string | null;
+  reused_from_run_id?: number | null;
+  reuse_fallback_reason?: string | null;
   has_error: boolean;
   has_logs: boolean;
   has_setup_logs: boolean;
@@ -143,6 +156,8 @@ export interface ResolvedRunConfig {
 export interface ClaimedRun {
   row: AgentRunRow;
   resolved: ResolvedRunConfig;
+  requested: ResolvedRunConfig;
+  requestedBaseBranch?: string | null;
 }
 
 export interface ExecutionInput {
@@ -150,6 +165,7 @@ export interface ExecutionInput {
   cwd: string;
   resolved: ResolvedRunConfig;
   config: ServiceConfig;
+  sessionId?: string;
 }
 
 export interface ExecutionResult {
@@ -160,6 +176,8 @@ export interface ExecutionResult {
   logs: string;
   result?: unknown;
   workspace?: WorkspaceResult;
+  sessionId?: string;
+  resumeUnavailable?: boolean;
 }
 
 export interface WorkspaceResult {
@@ -170,6 +188,7 @@ export interface WorkspaceResult {
   baseBranch?: string;
   setupLogs?: string;
   cleanupNote?: string;
+  reuseLogs?: string;
 }
 
 export interface WorkerStats {

@@ -12,6 +12,14 @@ describe("sql helpers", () => {
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS locked_by text");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS worktree_path text");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS worktree_removed_at timestamp");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS reuse_session boolean not null default false");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS session_id text");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS reused_from_run_id integer");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS reuse_fallback_reason text");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS requested_agent_provider text");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS requested_base_branch text");
+    expect(sql).toContain("agent_runs_reusable_uid_idx");
+    expect(sql).toContain("agent_runs_active_session_idx");
     expect(sql).toContain("agent_runs_status_priority_idx");
     expect(sql).toContain("agent_runs_created_at_id_idx");
     expect(sql).toContain("agent_runs_pending_worktree_cleanup_idx");

@@ -63,12 +63,33 @@ ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS base_branch text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS setup_logs text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS cleanup_note text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS worktree_removed_at timestamp;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS reuse_session boolean not null default false;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS session_id text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS reused_from_run_id integer;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS reuse_fallback_reason text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_agent_provider text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_agent_mode text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_model_name text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_reasoning_effort text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_base_branch text;
 
 CREATE INDEX IF NOT EXISTS agent_runs_status_priority_idx
     ON ${table} (status, priority DESC, created_at ASC);
 
 CREATE INDEX IF NOT EXISTS agent_runs_created_at_id_idx
     ON ${table} (created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS agent_runs_reusable_uid_idx
+    ON ${table} (uid, finished_at DESC, id DESC)
+    WHERE status = 'succeeded'
+      AND session_id IS NOT NULL
+      AND worktree_path IS NOT NULL
+      AND worktree_removed_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_active_session_idx
+    ON ${table} (session_id)
+    WHERE session_id IS NOT NULL
+      AND status IN ('queued', 'retry', 'running');
 
 DROP INDEX IF EXISTS ${schema}.agent_runs_completed_worktree_cleanup_idx;
 CREATE INDEX IF NOT EXISTS agent_runs_pending_worktree_cleanup_idx
