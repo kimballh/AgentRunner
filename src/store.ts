@@ -199,7 +199,7 @@ export class AgentRunStore {
            updated_at = NOW()
        WHERE worktree_path = (SELECT worktree_path FROM ${this.table} WHERE id = $1)
          AND worktree_removed_at IS NULL`,
-      [id, note],
+      [id, sanitizePostgresText(note)],
     );
   }
 
@@ -225,8 +225,8 @@ export class AgentRunStore {
          AND heartbeat_at < NOW() - ($1::text)::interval`,
       [
         `${this.config.staleAfterMs} milliseconds`,
-        JSON.stringify({ message: "runner heartbeat expired" }),
-        JSON.stringify({ message: "cancelled by user" }),
+        stringifyPostgresJson({ message: "runner heartbeat expired" }),
+        stringifyPostgresJson({ message: "cancelled by user" }),
       ],
     );
     return result.rowCount ?? 0;
@@ -581,12 +581,12 @@ export class AgentRunStore {
       [
         id,
         workerId,
-        workspace.repoPath ?? null,
-        workspace.worktreePath ?? null,
-        workspace.branchName ?? null,
-        workspace.baseBranch ?? null,
-        workspace.setupLogs ?? null,
-        workspace.cleanupNote ?? null,
+        nullablePostgresText(workspace.repoPath),
+        nullablePostgresText(workspace.worktreePath),
+        nullablePostgresText(workspace.branchName),
+        nullablePostgresText(workspace.baseBranch),
+        nullablePostgresText(workspace.setupLogs),
+        nullablePostgresText(workspace.cleanupNote),
       ],
     );
   }
@@ -614,15 +614,15 @@ export class AgentRunStore {
       [
         id,
         workerId,
-        result.link ?? null,
-        result.lastMessage ?? null,
-        JSON.stringify(result.conversation ?? null),
-        result.logs,
-        JSON.stringify(result.result ?? null),
+        nullablePostgresText(result.link),
+        nullablePostgresText(result.lastMessage),
+        stringifyPostgresJson(result.conversation ?? null),
+        sanitizePostgresText(result.logs),
+        stringifyPostgresJson(result.result ?? null),
         result.exitCode,
-        result.sessionId ?? null,
-        result.workspace?.setupLogs ?? null,
-        result.workspace?.cleanupNote ?? null,
+        nullablePostgresText(result.sessionId),
+        nullablePostgresText(result.workspace?.setupLogs),
+        nullablePostgresText(result.workspace?.cleanupNote),
       ],
     );
     return (updated.rowCount ?? 0) > 0;
@@ -655,16 +655,16 @@ export class AgentRunStore {
         id,
         workerId,
         shouldRetry ? "retry" : "failed",
-        result?.link ?? null,
-        result?.lastMessage ?? null,
-        result?.conversation === undefined ? null : JSON.stringify(result.conversation),
-        result?.logs ?? null,
-        result?.result === undefined ? null : JSON.stringify(result.result),
+        nullablePostgresText(result?.link),
+        nullablePostgresText(result?.lastMessage),
+        result?.conversation === undefined ? null : stringifyPostgresJson(result.conversation),
+        nullablePostgresText(result?.logs),
+        result?.result === undefined ? null : stringifyPostgresJson(result.result),
         result?.exitCode ?? 1,
-        result?.sessionId ?? null,
-        JSON.stringify(errorToJson(error)),
-        result?.workspace?.setupLogs ?? null,
-        result?.workspace?.cleanupNote ?? null,
+        nullablePostgresText(result?.sessionId),
+        stringifyPostgresJson(errorToJson(error)),
+        nullablePostgresText(result?.workspace?.setupLogs),
+        nullablePostgresText(result?.workspace?.cleanupNote),
       ],
     );
     return (updated.rowCount ?? 0) > 0;
@@ -694,16 +694,16 @@ export class AgentRunStore {
       [
         id,
         workerId,
-        result?.link ?? null,
-        result?.lastMessage ?? null,
-        result?.conversation === undefined ? null : JSON.stringify(result.conversation),
-        result?.logs ?? null,
-        result?.result === undefined ? null : JSON.stringify(result.result),
+        nullablePostgresText(result?.link),
+        nullablePostgresText(result?.lastMessage),
+        result?.conversation === undefined ? null : stringifyPostgresJson(result.conversation),
+        nullablePostgresText(result?.logs),
+        result?.result === undefined ? null : stringifyPostgresJson(result.result),
         result?.exitCode ?? null,
-        result?.sessionId ?? null,
-        JSON.stringify({ message: "cancelled by user" }),
-        result?.workspace?.setupLogs ?? null,
-        result?.workspace?.cleanupNote ?? null,
+        nullablePostgresText(result?.sessionId),
+        stringifyPostgresJson({ message: "cancelled by user" }),
+        nullablePostgresText(result?.workspace?.setupLogs),
+        nullablePostgresText(result?.workspace?.cleanupNote),
       ],
     );
     return (updated.rowCount ?? 0) > 0;
@@ -717,7 +717,7 @@ export class AgentRunStore {
            updated_at = NOW(),
            error = $2::jsonb
        WHERE id = $1`,
-      [row.id, JSON.stringify(errorToJson(error))],
+      [row.id, stringifyPostgresJson(errorToJson(error))],
     );
   }
 
@@ -780,6 +780,32 @@ export function errorToJson(error: unknown): Record<string, unknown> {
     return serialized as Record<string, unknown>;
   }
   return { message: String(serialized) };
+}
+
+const JSON_NUL_ESCAPE = /(^|[^\\])((?:\\\\)*)\\u0000/g;
+
+/** PostgreSQL text and jsonb values cannot contain U+0000. */
+export function sanitizePostgresText(value: string): string {
+  return value.replaceAll("\u0000", "\ufffd");
+}
+
+/**
+ * Serialize JSON while replacing only escapes produced from real NUL
+ * characters. Literal text such as `\\u0000` remains unchanged.
+ */
+export function stringifyPostgresJson(value: unknown): string {
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) {
+    return "null";
+  }
+  return serialized.replace(
+    JSON_NUL_ESCAPE,
+    (_match, prefix: string, escapedBackslashes: string) => `${prefix}${escapedBackslashes}\\ufffd`,
+  );
+}
+
+function nullablePostgresText(value: string | null | undefined): string | null {
+  return value == null ? null : sanitizePostgresText(value);
 }
 
 function serializeErrorValue(value: unknown, seen: Set<object>): unknown {

@@ -39,14 +39,43 @@ maybeDescribe("AgentRunStore integration", () => {
 
     await store.markSucceeded(claimed!.row.id, "worker-1", {
       exitCode: 0,
-      lastMessage: "done",
-      logs: "logs",
-      result: { ok: true },
+      lastMessage: "done\u0000now",
+      logs: "logs\u0000continued",
+      conversation: { aggregatedOutput: "value\u0000separator" },
+      result: { output: "result\u0000separator" },
     });
 
     const updated = await store.getRun(claimed!.row.id);
     expect(updated?.status).toBe("succeeded");
-    expect(updated?.last_message).toBe("done");
+    expect(updated?.last_message).toBe("done\ufffdnow");
+    expect(updated?.logs).toBe("logs\ufffdcontinued");
+    expect(updated?.conversation).toEqual({ aggregatedOutput: "value\ufffdseparator" });
+    expect(updated?.result).toEqual({ output: "result\ufffdseparator" });
+  });
+
+  test("sanitizes NUL characters while persisting a failed run", async () => {
+    await pool.query(
+      `INSERT INTO "${schema}"."agent_runs"
+       (status, raw_webhook_data, prompt, uid, created_at, priority, agent_provider)
+       VALUES ('queued', '{}'::jsonb, 'failure', 'failure', NOW(), 1003, 'codex')`,
+    );
+
+    const claimed = await store.claimNext("failure-worker");
+    await store.markFailed(claimed!.row.id, "failure-worker", claimed!.row, new Error("failed\u0000reason"), {
+      exitCode: 1,
+      lastMessage: "partial\u0000message",
+      logs: "partial\u0000logs",
+      conversation: { output: "partial\u0000conversation" },
+      result: { output: "partial\u0000result" },
+    });
+
+    const updated = await store.getRun(claimed!.row.id);
+    expect(updated?.status).toBe("failed");
+    expect(updated?.last_message).toBe("partial\ufffdmessage");
+    expect(updated?.logs).toBe("partial\ufffdlogs");
+    expect(updated?.conversation).toEqual({ output: "partial\ufffdconversation" });
+    expect(updated?.result).toEqual({ output: "partial\ufffdresult" });
+    expect(updated?.error).toMatchObject({ message: "failed\ufffdreason" });
   });
 
   test("claims only runs assigned to a worker's provider", async () => {
