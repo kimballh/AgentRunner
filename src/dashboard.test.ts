@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
-import { renderRunsPage } from "./dashboard.js";
+import { renderRunsPage, startDashboard } from "./dashboard.js";
+import { AgentRunStore } from "./store.js";
 import type { AgentRunRow, ServiceConfig } from "./types.js";
 
 describe("renderRunsPage", () => {
@@ -26,6 +27,80 @@ describe("renderRunsPage", () => {
     expect(html).toContain("Older");
     expect(html).toContain("before=");
     expect(html).toContain("25</option>");
+  });
+
+  test("offers cancellation only for running rows", () => {
+    const running = renderRunsPage({
+      page: { runs: [listRow({ id: 42, status: "running" })], hasMore: false },
+      stats: { active: 1, queued: 0, maxWorkers: 1, availableWorkers: 0 },
+      config: config(),
+    });
+    const queued = renderRunsPage({
+      page: { runs: [listRow({ id: 43, status: "queued" })], hasMore: false },
+      stats: { active: 0, queued: 1, maxWorkers: 1, availableWorkers: 1 },
+      config: config(),
+    });
+
+    expect(running).toContain(`onclick="cancelRun(42, this)"`);
+    expect(running).toContain(">Stop</button>");
+    expect(queued).not.toContain(`onclick="cancelRun(43, this)"`);
+  });
+
+  test("shows a requested cancellation as stopping", () => {
+    const html = renderRunsPage({
+      page: {
+        runs: [listRow({ status: "running", cancel_requested_at: new Date("2026-01-01T00:01:00Z") })],
+        hasMore: false,
+      },
+      stats: { active: 1, queued: 0, maxWorkers: 1, availableWorkers: 0 },
+      config: config(),
+    });
+
+    expect(html).toContain("status-stopping\">stopping");
+    expect(html).toContain("disabled>Stopping...</button>");
+  });
+});
+
+describe("dashboard cancellation endpoint", () => {
+  test("accepts same-origin cancellation requests", async () => {
+    const calls: number[] = [];
+    const dashboard = await startDashboard({
+      config: config(),
+      store: {} as AgentRunStore,
+      stats: () => ({ active: 1, queued: 0, maxWorkers: 1, availableWorkers: 0 }),
+      cancelRun: async (id) => {
+        calls.push(id);
+        return "requested";
+      },
+    });
+
+    try {
+      const url = new URL("/api/runs/42/cancel", dashboard.url);
+      const response = await fetch(url, { method: "POST", headers: { origin: url.origin } });
+      expect(response.status).toBe(202);
+      expect(calls).toEqual([42]);
+    } finally {
+      await dashboard.close();
+    }
+  });
+
+  test("rejects cross-origin cancellation requests", async () => {
+    const dashboard = await startDashboard({
+      config: config(),
+      store: {} as AgentRunStore,
+      stats: () => ({ active: 1, queued: 0, maxWorkers: 1, availableWorkers: 0 }),
+      cancelRun: async () => "requested",
+    });
+
+    try {
+      const response = await fetch(new URL("/api/runs/42/cancel", dashboard.url), {
+        method: "POST",
+        headers: { origin: "https://example.com" },
+      });
+      expect(response.status).toBe(403);
+    } finally {
+      await dashboard.close();
+    }
   });
 });
 
@@ -117,6 +192,7 @@ function listRow(overrides: Partial<ReturnType<typeof row>> & { created_at_curso
     session_id: base.session_id,
     reused_from_run_id: base.reused_from_run_id,
     reuse_fallback_reason: base.reuse_fallback_reason,
+    cancel_requested_at: base.cancel_requested_at,
     has_error: base.error !== null,
     has_logs: Boolean(base.logs),
     has_setup_logs: Boolean(base.setup_logs),

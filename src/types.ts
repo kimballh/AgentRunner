@@ -1,7 +1,7 @@
 export type AgentProvider = "codex" | "claude";
 export type AgentProviderMode = AgentProvider | "both";
 export type AgentMode = "exec" | "app-server";
-export type RunStatus = "queued" | "retry" | "running" | "succeeded" | "failed";
+export type RunStatus = "queued" | "retry" | "running" | "succeeded" | "failed" | "cancelled";
 export type WorktreeMode = "auto" | "always" | "never";
 export type SetupMode = "auto" | "always" | "never";
 
@@ -104,6 +104,7 @@ export interface AgentRunRow {
   requested_model_name?: string | null;
   requested_reasoning_effort?: string | null;
   requested_base_branch?: string | null;
+  cancel_requested_at?: Date | null;
 }
 
 export interface RunListItem {
@@ -133,6 +134,7 @@ export interface RunListItem {
   session_id?: string | null;
   reused_from_run_id?: number | null;
   reuse_fallback_reason?: string | null;
+  cancel_requested_at?: Date | null;
   has_error: boolean;
   has_logs: boolean;
   has_setup_logs: boolean;
@@ -166,6 +168,7 @@ export interface ExecutionInput {
   resolved: ResolvedRunConfig;
   config: ServiceConfig;
   sessionId?: string;
+  signal?: AbortSignal;
 }
 
 export interface ExecutionResult {

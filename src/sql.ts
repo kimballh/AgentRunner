@@ -72,6 +72,7 @@ ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_agent_mode text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_model_name text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_reasoning_effort text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_base_branch text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS cancel_requested_at timestamp;
 
 CREATE INDEX IF NOT EXISTS agent_runs_status_priority_idx
     ON ${table} (status, priority DESC, created_at ASC);
@@ -92,12 +93,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_active_session_idx
       AND status IN ('queued', 'retry', 'running');
 
 DROP INDEX IF EXISTS ${schema}.agent_runs_completed_worktree_cleanup_idx;
+DROP INDEX IF EXISTS ${schema}.agent_runs_pending_worktree_cleanup_idx;
 CREATE INDEX IF NOT EXISTS agent_runs_pending_worktree_cleanup_idx
     ON ${table} ((COALESCE(finished_at, updated_at, created_at)), id)
     INCLUDE (worktree_path, branch_name, status)
     WHERE worktree_path IS NOT NULL
       AND worktree_removed_at IS NULL
-      AND status IN ('succeeded', 'failed');
+      AND status IN ('succeeded', 'failed', 'cancelled');
 
 CREATE INDEX IF NOT EXISTS agent_runs_locked_at_idx
     ON ${table} (locked_at);`;

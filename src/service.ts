@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { startDashboard, type DashboardServer } from "./dashboard.js";
 import { runAgent } from "./executors/index.js";
 import { runPreflightPhase } from "./preflight.js";
-import { AgentRunStore } from "./store.js";
+import { AgentRunStore, type CancellationRequestResult } from "./store.js";
 import type {
   AgentProvider,
   ClaimedRun,
@@ -23,6 +23,7 @@ export class AgentRunnerService {
   private stopping = false;
   private dashboard?: DashboardServer;
   private pollTimer?: NodeJS.Timeout;
+  private readonly activeRuns = new Map<number, { workerId: string; controller: AbortController }>();
 
   constructor(private readonly config: ServiceConfig) {
     this.store = new AgentRunStore(config);
@@ -34,6 +35,7 @@ export class AgentRunnerService {
       config: this.config,
       store: this.store,
       stats: () => this.stats(),
+      cancelRun: (id) => this.cancelRun(id),
     });
     console.log(`AgentRunner dashboard: ${this.dashboard.url}`);
 
@@ -96,11 +98,26 @@ export class AgentRunnerService {
         continue;
       }
 
+      const controller = new AbortController();
+      this.activeRuns.set(claimed.row.id, { workerId, controller });
+      void this.store
+        .isCancellationRequested(claimed.row.id, workerId)
+        .then((cancelRequested) => {
+          if (cancelRequested) {
+            controller.abort();
+          }
+        })
+        .catch((error) => this.logWorkerError(workerId, `checking cancellation for run ${claimed.row.id}`, error));
       this.active++;
       await this.refreshQueued();
       const heartbeat = setInterval(() => {
         void this.store
           .heartbeat(claimed.row.id, workerId)
+          .then((cancelRequested) => {
+            if (cancelRequested) {
+              controller.abort();
+            }
+          })
           .catch((error) => this.logWorkerError(workerId, `heartbeating run ${claimed.row.id}`, error));
       }, Math.min(30_000, Math.max(5_000, Math.floor(this.config.staleAfterMs / 3))));
 
@@ -111,11 +128,18 @@ export class AgentRunnerService {
         );
         if (reuseRequested) {
           try {
-            workspace = await prepareReusedWorkspace({ config: this.config, run: claimed.row });
+            workspace = await prepareReusedWorkspace({
+              config: this.config,
+              run: claimed.row,
+              signal: controller.signal,
+            });
             await this.preflightPhase(workerId, claimed.row.id, "persist reused workspace metadata (database)", () =>
               this.store.recordWorkspace(claimed.row.id, workerId, workspace!),
             );
           } catch (error) {
+            if (controller.signal.aborted) {
+              throw error;
+            }
             claimed.row = await this.preflightPhase(
               workerId,
               claimed.row.id,
@@ -133,7 +157,7 @@ export class AgentRunnerService {
           }
         }
 
-        workspace ??= await this.prepareFreshWorkspace(claimed, workerId);
+        workspace ??= await this.prepareFreshWorkspace(claimed, workerId, controller.signal);
         const initialCwd = workspace.cwd;
 
         let result = await this.withProviderSlot(claimed.resolved.provider, () =>
@@ -143,9 +167,10 @@ export class AgentRunnerService {
             resolved: claimed.resolved,
             config: this.config,
             sessionId: claimed.row.reused_from_run_id ? claimed.row.session_id ?? undefined : undefined,
+            signal: controller.signal,
           }),
         );
-        if (result.resumeUnavailable && claimed.row.reused_from_run_id) {
+        if (!controller.signal.aborted && result.resumeUnavailable && claimed.row.reused_from_run_id) {
           claimed.row = await this.preflightPhase(
             workerId,
             claimed.row.id,
@@ -160,7 +185,7 @@ export class AgentRunnerService {
               ),
           );
           claimed.resolved = claimed.requested;
-          workspace = await this.prepareFreshWorkspace(claimed, workerId);
+          workspace = await this.prepareFreshWorkspace(claimed, workerId, controller.signal);
           const fallbackCwd = workspace.cwd;
           result = await this.withProviderSlot(claimed.resolved.provider, () =>
             runAgent({
@@ -168,6 +193,7 @@ export class AgentRunnerService {
               cwd: fallbackCwd,
               resolved: claimed.resolved,
               config: this.config,
+              signal: controller.signal,
             }),
           );
         }
@@ -178,33 +204,30 @@ export class AgentRunnerService {
         if (workspace.reuseLogs) {
           result.logs = `--- session reuse workspace refresh ---\n${workspace.reuseLogs}\n${result.logs}`;
         }
-        if (result.exitCode === 0) {
-          await this.store.markSucceeded(claimed.row.id, workerId, result);
-        } else {
-          await this.store.markFailed(
-            claimed.row.id,
-            workerId,
-            claimed.row,
-            { message: `agent exited with code ${result.exitCode}` },
-            result,
-          );
-        }
+        await this.finalizeResult(claimed, workerId, result, controller.signal);
       } catch (error) {
         const result = workspace ? failureResultForWorkspace(workspace) : undefined;
         await this.preflightPhase(workerId, claimed.row.id, "persist run failure (database)", () =>
-          this.store.markFailed(claimed.row.id, workerId, claimed.row, error, result),
+          this.finalizeError(claimed, workerId, error, result, controller.signal),
         ).catch((markError) => {
           this.logWorkerError(workerId, `marking run ${claimed.row.id} failed`, markError);
         });
       } finally {
         clearInterval(heartbeat);
+        if (this.activeRuns.get(claimed.row.id)?.controller === controller) {
+          this.activeRuns.delete(claimed.row.id);
+        }
         this.active--;
         await this.refreshQueued();
       }
     }
   }
 
-  private async prepareFreshWorkspace(claimed: ClaimedRun, workerId: string): Promise<WorkspaceResult> {
+  private async prepareFreshWorkspace(
+    claimed: ClaimedRun,
+    workerId: string,
+    signal: AbortSignal,
+  ): Promise<WorkspaceResult> {
     const cleanupEnabled = this.config.git.maxWorktrees > 0;
     const workspace = await prepareWorkspace({
       config: this.config,
@@ -237,6 +260,7 @@ export class AgentRunnerService {
         this.preflightPhase(workerId, claimed.row.id, "persist worktree cleanup (database)", () =>
           this.store.markWorktreeRemoved(id, note),
         ),
+      signal,
     });
     await this.preflightPhase(workerId, claimed.row.id, "persist workspace metadata (database)", () =>
       this.store.recordWorkspace(claimed.row.id, workerId, workspace),
@@ -244,7 +268,7 @@ export class AgentRunnerService {
 
     try {
       const setupLogs = await this.preflightPhase(workerId, claimed.row.id, "workspace setup", () =>
-        runWorkspaceSetup(this.config, workspace),
+        runWorkspaceSetup(this.config, workspace, signal),
       );
       if (setupLogs) {
         workspace.setupLogs = setupLogs;
@@ -263,6 +287,65 @@ export class AgentRunnerService {
       throw error;
     }
     return workspace;
+  }
+
+  private async cancelRun(id: number): Promise<CancellationRequestResult["outcome"]> {
+    const result = await this.store.requestCancellation(id);
+    if (result.outcome === "requested") {
+      const active = this.activeRuns.get(id);
+      if (active && active.workerId === result.lockedBy) {
+        active.controller.abort();
+      }
+    }
+    return result.outcome;
+  }
+
+  private async finalizeResult(
+    claimed: ClaimedRun,
+    workerId: string,
+    result: ExecutionResult,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (await this.cancellationRequested(claimed.row.id, workerId, signal)) {
+      await this.store.markCancelled(claimed.row.id, workerId, result);
+      return;
+    }
+
+    const finalized =
+      result.exitCode === 0
+        ? await this.store.markSucceeded(claimed.row.id, workerId, result)
+        : await this.store.markFailed(
+            claimed.row.id,
+            workerId,
+            claimed.row,
+            { message: `agent exited with code ${result.exitCode}` },
+            result,
+          );
+    if (!finalized && (await this.store.isCancellationRequested(claimed.row.id, workerId))) {
+      await this.store.markCancelled(claimed.row.id, workerId, result);
+    }
+  }
+
+  private async finalizeError(
+    claimed: ClaimedRun,
+    workerId: string,
+    error: unknown,
+    result: ExecutionResult | undefined,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (await this.cancellationRequested(claimed.row.id, workerId, signal)) {
+      await this.store.markCancelled(claimed.row.id, workerId, result);
+      return;
+    }
+
+    const finalized = await this.store.markFailed(claimed.row.id, workerId, claimed.row, error, result);
+    if (!finalized && (await this.store.isCancellationRequested(claimed.row.id, workerId))) {
+      await this.store.markCancelled(claimed.row.id, workerId, result);
+    }
+  }
+
+  private async cancellationRequested(id: number, workerId: string, signal: AbortSignal): Promise<boolean> {
+    return signal.aborted || this.store.isCancellationRequested(id, workerId);
   }
 
   private logWorkerError(workerId: string, action: string, error: unknown): void {

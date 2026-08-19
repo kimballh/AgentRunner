@@ -70,6 +70,32 @@ maybeDescribe("AgentRunStore integration", () => {
     await store.markSucceeded(codex!.row.id, "codex-worker", { exitCode: 0, logs: "done" });
   });
 
+  test("cancels a running job without retrying it", async () => {
+    await pool.query(
+      `INSERT INTO "${schema}"."agent_runs"
+       (status, raw_webhook_data, prompt, uid, created_at, priority, agent_provider, num_retries)
+       VALUES ('queued', '{}'::jsonb, 'cancel me', 'cancel-me', NOW(), 1000, 'codex', 3)`,
+    );
+
+    const claimed = await store.claimNext("cancel-worker");
+    expect(claimed?.row.uid).toBe("cancel-me");
+    expect(await store.requestCancellation(claimed!.row.id)).toMatchObject({
+      outcome: "requested",
+      lockedBy: "cancel-worker",
+    });
+    expect(await store.heartbeat(claimed!.row.id, "cancel-worker")).toBe(true);
+    expect(await store.markSucceeded(claimed!.row.id, "cancel-worker", { exitCode: 0, logs: "too late" })).toBe(
+      false,
+    );
+    expect(await store.markCancelled(claimed!.row.id, "cancel-worker", { exitCode: 1, logs: "partial" })).toBe(true);
+
+    const updated = await store.getRun(claimed!.row.id);
+    expect(updated?.status).toBe("cancelled");
+    expect(updated?.logs).toBe("partial");
+    expect(updated?.error).toMatchObject({ message: "cancelled by user" });
+    expect(await store.requestCancellation(claimed!.row.id)).toEqual({ outcome: "not-running" });
+  });
+
   test("returns all narrow cleanup candidates and excludes persisted removals", async () => {
     const inserted = await pool.query<{ id: number }>(
       `INSERT INTO "${schema}"."agent_runs"

@@ -71,6 +71,11 @@ After `run` starts, it prints a local dashboard URL:
 AgentRunner dashboard: http://127.0.0.1:49321/runs
 ```
 
+Running rows include a **Stop** action. Cancellation asks the agent process to
+exit gracefully, force-kills it after a short timeout if necessary, and records
+the run as `cancelled` without consuming its configured retries. Existing logs,
+session metadata, and worktree metadata are retained.
+
 ## Configuration
 
 Config precedence is CLI args, env vars, TOML, then defaults. `$cwd/.env` is
