@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { startDashboard, type DashboardServer } from "./dashboard.js";
 import { runAgent } from "./executors/index.js";
 import { runPreflightPhase } from "./preflight.js";
-import { AgentRunStore, type CancellationRequestResult } from "./store.js";
+import { AgentRunStore, type CancellationRequestResult, type RetryRequestOutcome } from "./store.js";
 import type {
   AgentProvider,
   ClaimedRun,
@@ -36,6 +36,7 @@ export class AgentRunnerService {
       store: this.store,
       stats: () => this.stats(),
       cancelRun: (id) => this.cancelRun(id),
+      retryRun: (id) => this.retryRun(id),
     });
     console.log(`AgentRunner dashboard: ${this.dashboard.url}`);
 
@@ -298,6 +299,14 @@ export class AgentRunnerService {
       }
     }
     return result.outcome;
+  }
+
+  private async retryRun(id: number): Promise<RetryRequestOutcome> {
+    const outcome = await this.store.retryFailedRun(id);
+    if (outcome === "queued") {
+      await this.refreshQueued();
+    }
+    return outcome;
   }
 
   private async finalizeResult(

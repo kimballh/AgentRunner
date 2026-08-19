@@ -16,6 +16,7 @@ export async function startDashboard(input: {
   store: AgentRunStore;
   stats: () => WorkerStats;
   cancelRun: (id: number) => Promise<"requested" | "not-running" | "not-found">;
+  retryRun: (id: number) => Promise<"queued" | "not-failed" | "not-found">;
 }): Promise<DashboardServer> {
   const server = http.createServer(async (request, response) => {
     try {
@@ -47,6 +48,21 @@ export async function startDashboard(input: {
           return json(response, { error: "run is no longer running" }, 409);
         }
         return json(response, { ok: true, status: "stopping" }, 202);
+      }
+
+      const retryMatch = /^\/api\/runs\/(\d+)\/retry$/.exec(url.pathname);
+      if (request.method === "POST" && retryMatch) {
+        if (!isSameOrigin(request)) {
+          return json(response, { error: "cross-origin retry is not allowed" }, 403);
+        }
+        const outcome = await input.retryRun(Number(retryMatch[1]));
+        if (outcome === "not-found") {
+          return json(response, { error: "run not found" }, 404);
+        }
+        if (outcome === "not-failed") {
+          return json(response, { error: "run is no longer failed" }, 409);
+        }
+        return json(response, { ok: true, status: "retry" }, 202);
       }
 
       const detailMatch = /^\/api\/runs\/(\d+)$/.exec(url.pathname);
@@ -143,6 +159,7 @@ export function renderRunsPage(input: {
     .link-button[aria-disabled="true"] { pointer-events: none; cursor: not-allowed; opacity: 0.45; }
     button:disabled { cursor: not-allowed; opacity: 0.45; }
     .danger-button { border-color: #f0a39d; color: #b42318; }
+    .retry-button { border-color: #8ab6e8; color: #0b65c2; }
     .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(16, 24, 40, 0.45); align-items: center; justify-content: center; padding: 24px; }
     .modal { width: min(960px, calc(100vw - 48px)); max-height: 84vh; overflow: auto; background: #fff; border-radius: 8px; box-shadow: 0 20px 50px rgba(16, 24, 40, 0.2); }
     .modal header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid #d9dee8; }
@@ -243,6 +260,26 @@ export function renderRunsPage(input: {
         window.alert(error instanceof Error ? error.message : String(error));
       }
     }
+    async function retryRun(id, button) {
+      const previous = button.textContent;
+      button.disabled = true;
+      button.textContent = 'Retrying...';
+      try {
+        const response = await fetch('/api/runs/' + id + '/retry', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.error || 'Unable to retry run.');
+        }
+        window.setTimeout(() => window.location.reload(), 250);
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = previous;
+        window.alert(error instanceof Error ? error.message : String(error));
+      }
+    }
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape') closeModal();
     });
@@ -282,6 +319,7 @@ function runRow(run: RunListItem): string {
       <button type="button" ${run.has_logs ? "" : "disabled"} onclick="openText('Logs', '/api/runs/${run.id}/logs')">Logs</button>
       <button type="button" ${run.has_setup_logs ? "" : "disabled"} onclick="openText('Setup logs', '/api/runs/${run.id}/setup-logs')">Setup</button>
       <a class="link-button" ${run.has_conversation ? "" : `aria-disabled="true"`} href="/api/runs/${run.id}/conversation">Conversation</a>
+      ${run.status === "failed" ? `<button type="button" class="retry-button" onclick="retryRun(${run.id}, this)">Retry</button>` : ""}
       ${run.status === "running" ? `<button type="button" class="danger-button" ${run.cancel_requested_at ? "disabled" : `onclick="cancelRun(${run.id}, this)"`}>${run.cancel_requested_at ? "Stopping..." : "Stop"}</button>` : ""}
     </div></td>
   </tr>`;

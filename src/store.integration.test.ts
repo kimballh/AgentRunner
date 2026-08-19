@@ -96,6 +96,28 @@ maybeDescribe("AgentRunStore integration", () => {
     expect(await store.requestCancellation(claimed!.row.id)).toEqual({ outcome: "not-running" });
   });
 
+  test("manually retries a failed run exactly once", async () => {
+    const inserted = await pool.query<{ id: number }>(
+      `INSERT INTO "${schema}"."agent_runs"
+       (status, raw_webhook_data, prompt, uid, created_at, finished_at, priority, attempts, num_retries)
+       VALUES ('failed', '{}'::jsonb, 'try again', 'manual-retry', NOW(), NOW(), 900, 3, 2)
+       RETURNING id`,
+    );
+    const id = inserted.rows[0].id;
+
+    expect(await store.retryFailedRun(id)).toBe("queued");
+    expect(await store.retryFailedRun(id)).toBe("not-failed");
+
+    const queued = await store.getRun(id);
+    expect(queued).toMatchObject({ status: "retry", attempts: 3, num_retries: 3, finished_at: null });
+
+    const claimed = await store.claimNext("manual-retry-worker");
+    expect(claimed?.row.id).toBe(id);
+    expect(claimed?.row.attempts).toBe(4);
+    await store.markFailed(id, "manual-retry-worker", claimed!.row, { message: "still failing" });
+    expect((await store.getRun(id))?.status).toBe("failed");
+  });
+
   test("returns all narrow cleanup candidates and excludes persisted removals", async () => {
     const inserted = await pool.query<{ id: number }>(
       `INSERT INTO "${schema}"."agent_runs"
