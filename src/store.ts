@@ -34,6 +34,8 @@ export type CancellationRequestResult =
   | { outcome: "not-running" }
   | { outcome: "not-found" };
 
+export type RetryRequestOutcome = "queued" | "not-failed" | "not-found";
+
 export class AgentRunStore {
   private readonly pool: Pool;
   private readonly table: string;
@@ -518,6 +520,29 @@ export class AgentRunStore {
 
     const existing = await this.pool.query<{ status: string }>(`SELECT status FROM ${this.table} WHERE id = $1`, [id]);
     return existing.rows[0] ? { outcome: "not-running" } : { outcome: "not-found" };
+  }
+
+  async retryFailedRun(id: number): Promise<RetryRequestOutcome> {
+    const retried = await this.pool.query(
+      `UPDATE ${this.table}
+       SET status = 'retry',
+           num_retries = GREATEST(COALESCE(num_retries, 0), COALESCE(attempts, 0)),
+           finished_at = NULL,
+           updated_at = NOW(),
+           locked_by = NULL,
+           locked_at = NULL,
+           heartbeat_at = NULL,
+           cancel_requested_at = NULL
+       WHERE id = $1 AND status = 'failed'
+       RETURNING id`,
+      [id],
+    );
+    if (retried.rows[0]) {
+      return "queued";
+    }
+
+    const existing = await this.pool.query<{ status: string }>(`SELECT status FROM ${this.table} WHERE id = $1`, [id]);
+    return existing.rows[0] ? "not-failed" : "not-found";
   }
 
   async isCancellationRequested(id: number, workerId: string): Promise<boolean> {

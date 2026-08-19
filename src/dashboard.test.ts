@@ -59,6 +59,23 @@ describe("renderRunsPage", () => {
     expect(html).toContain("status-stopping\">stopping");
     expect(html).toContain("disabled>Stopping...</button>");
   });
+
+  test("offers retry only for failed rows", () => {
+    const failed = renderRunsPage({
+      page: { runs: [listRow({ id: 42, status: "failed" })], hasMore: false },
+      stats: { active: 0, queued: 0, maxWorkers: 1, availableWorkers: 1 },
+      config: config(),
+    });
+    const succeeded = renderRunsPage({
+      page: { runs: [listRow({ id: 43, status: "succeeded" })], hasMore: false },
+      stats: { active: 0, queued: 0, maxWorkers: 1, availableWorkers: 1 },
+      config: config(),
+    });
+
+    expect(failed).toContain(`onclick="retryRun(42, this)"`);
+    expect(failed).toContain(">Retry</button>");
+    expect(succeeded).not.toContain(`onclick="retryRun(43, this)"`);
+  });
 });
 
 describe("dashboard cancellation endpoint", () => {
@@ -72,6 +89,7 @@ describe("dashboard cancellation endpoint", () => {
         calls.push(id);
         return "requested";
       },
+      retryRun: async () => "not-failed",
     });
 
     try {
@@ -90,6 +108,7 @@ describe("dashboard cancellation endpoint", () => {
       store: {} as AgentRunStore,
       stats: () => ({ active: 1, queued: 0, maxWorkers: 1, availableWorkers: 0 }),
       cancelRun: async () => "requested",
+      retryRun: async () => "not-failed",
     });
 
     try {
@@ -98,6 +117,49 @@ describe("dashboard cancellation endpoint", () => {
         headers: { origin: "https://example.com" },
       });
       expect(response.status).toBe(403);
+    } finally {
+      await dashboard.close();
+    }
+  });
+});
+
+describe("dashboard retry endpoint", () => {
+  test("accepts same-origin retry requests", async () => {
+    const calls: number[] = [];
+    const dashboard = await startDashboard({
+      config: config(),
+      store: {} as AgentRunStore,
+      stats: () => ({ active: 0, queued: 0, maxWorkers: 1, availableWorkers: 1 }),
+      cancelRun: async () => "not-running",
+      retryRun: async (id) => {
+        calls.push(id);
+        return "queued";
+      },
+    });
+
+    try {
+      const url = new URL("/api/runs/42/retry", dashboard.url);
+      const response = await fetch(url, { method: "POST", headers: { origin: url.origin } });
+      expect(response.status).toBe(202);
+      expect(calls).toEqual([42]);
+    } finally {
+      await dashboard.close();
+    }
+  });
+
+  test("rejects retrying a run that is no longer failed", async () => {
+    const dashboard = await startDashboard({
+      config: config(),
+      store: {} as AgentRunStore,
+      stats: () => ({ active: 0, queued: 1, maxWorkers: 1, availableWorkers: 1 }),
+      cancelRun: async () => "not-running",
+      retryRun: async () => "not-failed",
+    });
+
+    try {
+      const url = new URL("/api/runs/42/retry", dashboard.url);
+      const response = await fetch(url, { method: "POST", headers: { origin: url.origin } });
+      expect(response.status).toBe(409);
     } finally {
       await dashboard.close();
     }
