@@ -7,7 +7,7 @@ import { runCommandOrThrow, runProcess, type ProcessResult } from "./process.js"
 import type { AgentRunRow, CompletedRunForCleanup, ServiceConfig, WorkspaceResult } from "./types.js";
 
 export interface WorkspaceCommandRunner {
-  run(command: string[], options: { cwd: string; label: string }): Promise<ProcessResult>;
+  run(command: string[], options: { cwd: string; label: string; signal?: AbortSignal }): Promise<ProcessResult>;
 }
 
 export const defaultWorkspaceRunner: WorkspaceCommandRunner = {
@@ -26,11 +26,14 @@ export interface WorkspacePreparationInput {
   withCleanupLock?: <T>(repoRoot: string, operation: () => Promise<T>) => Promise<T>;
   onWorktreeRemoved?: (id: number, note: string) => Promise<void>;
   runner?: WorkspaceCommandRunner;
+  signal?: AbortSignal;
 }
 
 export async function prepareWorkspace(input: WorkspacePreparationInput): Promise<WorkspaceResult> {
-  const runner = input.runner ?? defaultWorkspaceRunner;
-  const repo = await workspacePhase(input.config, "resolve Git repository", () => resolveRepo(input.config, runner));
+  const runner = withAbortSignal(input.runner ?? defaultWorkspaceRunner, input.signal);
+  const repo = await workspacePhase(input.config, "resolve Git repository", () =>
+    resolveRepo(input.config, runner, input.signal),
+  );
   if (!repo.enabled) {
     return { cwd: input.config.cwd };
   }
@@ -100,15 +103,16 @@ export async function prepareReusedWorkspace(input: {
   config: ServiceConfig;
   run: AgentRunRow;
   runner?: WorkspaceCommandRunner;
+  signal?: AbortSignal;
 }): Promise<WorkspaceResult> {
-  const runner = input.runner ?? defaultWorkspaceRunner;
+  const runner = withAbortSignal(input.runner ?? defaultWorkspaceRunner, input.signal);
   const worktreePath = input.run.worktree_path ? path.resolve(input.run.worktree_path) : undefined;
   if (!worktreePath || !input.run.session_id || !input.run.reused_from_run_id) {
     throw new Error("reusable run is missing its session or worktree metadata");
   }
 
   const repo = await workspacePhase(input.config, "resolve reusable Git repository", () =>
-    resolveRepo(input.config, runner),
+    resolveRepo(input.config, runner, input.signal),
   );
   if (!repo.enabled) {
     throw new Error("session reuse requires Git worktrees to be enabled");
@@ -212,13 +216,17 @@ async function bestEffortWorkspaceCommand(
   }
 }
 
-export async function runWorkspaceSetup(config: ServiceConfig, workspace: WorkspaceResult): Promise<string | undefined> {
+export async function runWorkspaceSetup(
+  config: ServiceConfig,
+  workspace: WorkspaceResult,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   if (!workspace.worktreePath || config.git.setup === "never") {
     return undefined;
   }
 
   if (config.git.setupCommand.length > 0) {
-    const result = await runProcess(config.git.setupCommand, { cwd: workspace.worktreePath });
+    const result = await runProcess(config.git.setupCommand, { cwd: workspace.worktreePath, signal });
     const logs = logsFor(result);
     if (result.exitCode !== 0) {
       throw new WorkspaceSetupError(`setup command failed with exit ${result.exitCode}`, logs);
@@ -237,6 +245,7 @@ export async function runWorkspaceSetup(config: ServiceConfig, workspace: Worksp
   const result = await runProcess(["bash", script.path], {
     cwd: workspace.worktreePath,
     stdin: script.inlineScript,
+    signal,
   });
   const logs = logsFor(result);
   if (result.exitCode !== 0) {
@@ -255,6 +264,7 @@ export class WorkspaceSetupError extends Error {
 async function resolveRepo(
   config: ServiceConfig,
   runner: WorkspaceCommandRunner,
+  signal?: AbortSignal,
 ): Promise<{ enabled: false } | { enabled: true; root: string }> {
   if (config.git.createWorktrees === "never") {
     return { enabled: false };
@@ -264,7 +274,7 @@ async function resolveRepo(
     return { enabled: true, root: configuredRepo };
   }
 
-  const result = await runProcess(["git", "rev-parse", "--show-toplevel"], { cwd: config.cwd });
+  const result = await runProcess(["git", "rev-parse", "--show-toplevel"], { cwd: config.cwd, signal });
   if (result.exitCode !== 0) {
     if (config.git.createWorktrees === "always") {
       throw new Error("git.create_worktrees is always but cwd is not inside a Git repository");
@@ -282,6 +292,15 @@ async function resolveRepo(
 
   await runner.run(["git", "rev-parse", "--git-dir"], { cwd: root, label: "verify git repository" });
   return { enabled: true, root };
+}
+
+function withAbortSignal(runner: WorkspaceCommandRunner, signal?: AbortSignal): WorkspaceCommandRunner {
+  if (!signal) {
+    return runner;
+  }
+  return {
+    run: (command, options) => runner.run(command, { ...options, signal }),
+  };
 }
 
 async function resolveUpstreamBranch(repoRoot: string, runner: WorkspaceCommandRunner): Promise<string> {

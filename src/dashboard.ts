@@ -15,6 +15,7 @@ export async function startDashboard(input: {
   config: ServiceConfig;
   store: AgentRunStore;
   stats: () => WorkerStats;
+  cancelRun: (id: number) => Promise<"requested" | "not-running" | "not-found">;
 }): Promise<DashboardServer> {
   const server = http.createServer(async (request, response) => {
     try {
@@ -31,6 +32,21 @@ export async function startDashboard(input: {
         const pagination = parseRunListOptions(url.searchParams);
         const page = await input.store.listRuns(pagination);
         return json(response, { ...page, pagination, stats: input.stats() });
+      }
+
+      const cancelMatch = /^\/api\/runs\/(\d+)\/cancel$/.exec(url.pathname);
+      if (request.method === "POST" && cancelMatch) {
+        if (!isSameOrigin(request)) {
+          return json(response, { error: "cross-origin cancellation is not allowed" }, 403);
+        }
+        const outcome = await input.cancelRun(Number(cancelMatch[1]));
+        if (outcome === "not-found") {
+          return json(response, { error: "run not found" }, 404);
+        }
+        if (outcome === "not-running") {
+          return json(response, { error: "run is no longer running" }, 409);
+        }
+        return json(response, { ok: true, status: "stopping" }, 202);
       }
 
       const detailMatch = /^\/api\/runs\/(\d+)$/.exec(url.pathname);
@@ -120,11 +136,13 @@ export function renderRunsPage(input: {
     .status-succeeded { color: #197044; }
     .status-failed { color: #b42318; }
     .status-retry { color: #7a5b00; }
+    .status-cancelled, .status-stopping { color: #b54708; }
     .muted { color: #667085; }
     .actions { display: flex; gap: 6px; flex-wrap: wrap; min-width: 172px; }
     button, .link-button { border: 1px solid #bcc5d3; background: #fff; color: #172033; border-radius: 5px; padding: 4px 8px; cursor: pointer; text-decoration: none; font: inherit; white-space: nowrap; }
     .link-button[aria-disabled="true"] { pointer-events: none; cursor: not-allowed; opacity: 0.45; }
     button:disabled { cursor: not-allowed; opacity: 0.45; }
+    .danger-button { border-color: #f0a39d; color: #b42318; }
     .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(16, 24, 40, 0.45); align-items: center; justify-content: center; padding: 24px; }
     .modal { width: min(960px, calc(100vw - 48px)); max-height: 84vh; overflow: auto; background: #fff; border-radius: 8px; box-shadow: 0 20px 50px rgba(16, 24, 40, 0.2); }
     .modal header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid #d9dee8; }
@@ -204,6 +222,27 @@ export function renderRunsPage(input: {
     function closeModal() {
       document.getElementById('modalBackdrop').style.display = 'none';
     }
+    async function cancelRun(id, button) {
+      if (!window.confirm('Stop run #' + id + '? The agent process will be terminated.')) return;
+      const previous = button.textContent;
+      button.disabled = true;
+      button.textContent = 'Stopping...';
+      try {
+        const response = await fetch('/api/runs/' + id + '/cancel', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.error || 'Unable to stop run.');
+        }
+        window.setTimeout(() => window.location.reload(), 250);
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = previous;
+        window.alert(error instanceof Error ? error.message : String(error));
+      }
+    }
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape') closeModal();
     });
@@ -213,8 +252,9 @@ export function renderRunsPage(input: {
 }
 
 function runRow(run: RunListItem): string {
+  const displayStatus = run.status === "running" && run.cancel_requested_at ? "stopping" : run.status;
   return `<tr>
-    <td><span class="status status-${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></td>
+    <td><span class="status status-${escapeHtml(displayStatus)}">${escapeHtml(displayStatus)}</span></td>
     <td><strong>${escapeHtml(run.uid)}</strong><br><code>#${run.id}</code></td>
     <td>${escapeHtml(run.agent_provider ?? "")}</td>
     <td>${escapeHtml(run.agent_mode ?? "")}</td>
@@ -242,6 +282,7 @@ function runRow(run: RunListItem): string {
       <button type="button" ${run.has_logs ? "" : "disabled"} onclick="openText('Logs', '/api/runs/${run.id}/logs')">Logs</button>
       <button type="button" ${run.has_setup_logs ? "" : "disabled"} onclick="openText('Setup logs', '/api/runs/${run.id}/setup-logs')">Setup</button>
       <a class="link-button" ${run.has_conversation ? "" : `aria-disabled="true"`} href="/api/runs/${run.id}/conversation">Conversation</a>
+      ${run.status === "running" ? `<button type="button" class="danger-button" ${run.cancel_requested_at ? "disabled" : `onclick="cancelRun(${run.id}, this)"`}>${run.cancel_requested_at ? "Stopping..." : "Stop"}</button>` : ""}
     </div></td>
   </tr>`;
 }
@@ -334,6 +375,18 @@ function html(response: http.ServerResponse, value: string, status = 200): void 
 function text(response: http.ServerResponse, value: string, status = 200): void {
   response.writeHead(status, { "content-type": "text/plain; charset=utf-8" });
   response.end(value);
+}
+
+function isSameOrigin(request: http.IncomingMessage): boolean {
+  const origin = request.headers.origin;
+  if (!origin) {
+    return true;
+  }
+  try {
+    return new URL(origin).host === request.headers.host;
+  } catch {
+    return false;
+  }
 }
 
 function escapeHtml(value: string): string {

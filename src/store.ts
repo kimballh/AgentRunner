@@ -28,6 +28,11 @@ export interface RunListPage {
   hasMore: boolean;
 }
 
+export type CancellationRequestResult =
+  | { outcome: "requested"; lockedBy: string | null }
+  | { outcome: "not-running" }
+  | { outcome: "not-found" };
+
 export class AgentRunStore {
   private readonly pool: Pool;
   private readonly table: string;
@@ -106,6 +111,7 @@ export class AgentRunStore {
               session_id,
               reused_from_run_id,
               reuse_fallback_reason,
+              cancel_requested_at,
               error IS NOT NULL AS has_error,
               logs IS NOT NULL AND logs <> '' AS has_logs,
               setup_logs IS NOT NULL AND setup_logs <> '' AS has_setup_logs,
@@ -139,7 +145,7 @@ export class AgentRunStore {
          FROM ${this.table} AS completed
          WHERE completed.worktree_path IS NOT NULL
            AND completed.worktree_removed_at IS NULL
-           AND completed.status IN ('succeeded', 'failed')
+           AND completed.status IN ('succeeded', 'failed', 'cancelled')
            AND NOT EXISTS (
              SELECT 1
              FROM ${this.table} AS active
@@ -198,22 +204,27 @@ export class AgentRunStore {
     const result = await this.pool.query(
       `UPDATE ${this.table}
        SET status = CASE
+             WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'
              WHEN COALESCE(attempts, 0) <= COALESCE(num_retries, 0) THEN 'retry'
              ELSE 'failed'
            END,
            finished_at = CASE
-             WHEN COALESCE(attempts, 0) <= COALESCE(num_retries, 0) THEN finished_at
+             WHEN cancel_requested_at IS NULL AND COALESCE(attempts, 0) <= COALESCE(num_retries, 0) THEN finished_at
              ELSE COALESCE(finished_at, NOW())
            END,
            updated_at = NOW(),
            locked_by = NULL,
            locked_at = NULL,
            heartbeat_at = NULL,
-           error = COALESCE(error, $2::jsonb)
+           error = COALESCE(error, CASE WHEN cancel_requested_at IS NOT NULL THEN $3::jsonb ELSE $2::jsonb END)
        WHERE status = 'running'
          AND heartbeat_at IS NOT NULL
          AND heartbeat_at < NOW() - ($1::text)::interval`,
-      [`${this.config.staleAfterMs} milliseconds`, JSON.stringify({ message: "runner heartbeat expired" })],
+      [
+        `${this.config.staleAfterMs} milliseconds`,
+        JSON.stringify({ message: "runner heartbeat expired" }),
+        JSON.stringify({ message: "cancelled by user" }),
+      ],
     );
     return result.rowCount ?? 0;
   }
@@ -436,13 +447,42 @@ export class AgentRunStore {
     return row;
   }
 
-  async heartbeat(id: number, workerId: string): Promise<void> {
-    await this.pool.query(
+  async requestCancellation(id: number): Promise<CancellationRequestResult> {
+    const requested = await this.pool.query<{ locked_by: string | null }>(
       `UPDATE ${this.table}
-       SET heartbeat_at = NOW(), updated_at = NOW()
+       SET cancel_requested_at = COALESCE(cancel_requested_at, NOW()),
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'running'
+       RETURNING locked_by`,
+      [id],
+    );
+    if (requested.rows[0]) {
+      return { outcome: "requested", lockedBy: requested.rows[0].locked_by };
+    }
+
+    const existing = await this.pool.query<{ status: string }>(`SELECT status FROM ${this.table} WHERE id = $1`, [id]);
+    return existing.rows[0] ? { outcome: "not-running" } : { outcome: "not-found" };
+  }
+
+  async isCancellationRequested(id: number, workerId: string): Promise<boolean> {
+    const result = await this.pool.query<{ requested: boolean }>(
+      `SELECT cancel_requested_at IS NOT NULL AS requested
+       FROM ${this.table}
        WHERE id = $1 AND locked_by = $2 AND status = 'running'`,
       [id, workerId],
     );
+    return result.rows[0]?.requested ?? false;
+  }
+
+  async heartbeat(id: number, workerId: string): Promise<boolean> {
+    const result = await this.pool.query<{ cancel_requested: boolean }>(
+      `UPDATE ${this.table}
+       SET heartbeat_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND locked_by = $2 AND status = 'running'
+       RETURNING cancel_requested_at IS NOT NULL AS cancel_requested`,
+      [id, workerId],
+    );
+    return result.rows[0]?.cancel_requested ?? false;
   }
 
   async recordWorkspace(id: number, workerId: string, workspace: WorkspaceResult): Promise<void> {
@@ -470,8 +510,8 @@ export class AgentRunStore {
     );
   }
 
-  async markSucceeded(id: number, workerId: string, result: ExecutionResult): Promise<void> {
-    await this.pool.query(
+  async markSucceeded(id: number, workerId: string, result: ExecutionResult): Promise<boolean> {
+    const updated = await this.pool.query(
       `UPDATE ${this.table}
        SET status = 'succeeded',
            finished_at = NOW(),
@@ -489,7 +529,7 @@ export class AgentRunStore {
            locked_by = NULL,
            locked_at = NULL,
            heartbeat_at = NULL
-       WHERE id = $1 AND locked_by = $2`,
+       WHERE id = $1 AND locked_by = $2 AND status = 'running' AND cancel_requested_at IS NULL`,
       [
         id,
         workerId,
@@ -504,13 +544,14 @@ export class AgentRunStore {
         result.workspace?.cleanupNote ?? null,
       ],
     );
+    return (updated.rowCount ?? 0) > 0;
   }
 
-  async markFailed(id: number, workerId: string, run: AgentRunRow, error: unknown, result?: ExecutionResult): Promise<void> {
+  async markFailed(id: number, workerId: string, run: AgentRunRow, error: unknown, result?: ExecutionResult): Promise<boolean> {
     const attempts = run.attempts ?? 1;
     const retries = run.num_retries ?? 0;
     const shouldRetry = attempts <= retries;
-    await this.pool.query(
+    const updated = await this.pool.query(
       `UPDATE ${this.table}
        SET status = $3,
            finished_at = CASE WHEN $3 = 'failed' THEN NOW() ELSE finished_at END,
@@ -528,7 +569,7 @@ export class AgentRunStore {
            locked_by = NULL,
            locked_at = NULL,
            heartbeat_at = NULL
-       WHERE id = $1 AND locked_by = $2`,
+       WHERE id = $1 AND locked_by = $2 AND status = 'running' AND cancel_requested_at IS NULL`,
       [
         id,
         workerId,
@@ -545,6 +586,46 @@ export class AgentRunStore {
         result?.workspace?.cleanupNote ?? null,
       ],
     );
+    return (updated.rowCount ?? 0) > 0;
+  }
+
+  async markCancelled(id: number, workerId: string, result?: ExecutionResult): Promise<boolean> {
+    const updated = await this.pool.query(
+      `UPDATE ${this.table}
+       SET status = 'cancelled',
+           finished_at = NOW(),
+           updated_at = NOW(),
+           link = COALESCE($3, link),
+           last_message = COALESCE($4, last_message),
+           conversation = COALESCE($5::jsonb, conversation),
+           logs = COALESCE($6, logs),
+           result = COALESCE($7::jsonb, result),
+           exit_code = COALESCE($8, exit_code, 1),
+           session_id = COALESCE($9, session_id),
+           error = $10::jsonb,
+           setup_logs = COALESCE($11, setup_logs),
+           cleanup_note = COALESCE($12, cleanup_note),
+           cancel_requested_at = COALESCE(cancel_requested_at, NOW()),
+           locked_by = NULL,
+           locked_at = NULL,
+           heartbeat_at = NULL
+       WHERE id = $1 AND locked_by = $2 AND status = 'running'`,
+      [
+        id,
+        workerId,
+        result?.link ?? null,
+        result?.lastMessage ?? null,
+        result?.conversation === undefined ? null : JSON.stringify(result.conversation),
+        result?.logs ?? null,
+        result?.result === undefined ? null : JSON.stringify(result.result),
+        result?.exitCode ?? null,
+        result?.sessionId ?? null,
+        JSON.stringify({ message: "cancelled by user" }),
+        result?.workspace?.setupLogs ?? null,
+        result?.workspace?.cleanupNote ?? null,
+      ],
+    );
+    return (updated.rowCount ?? 0) > 0;
   }
 
   private async markInvalidClaim(client: PoolClient, row: AgentRunRow, error: unknown): Promise<void> {

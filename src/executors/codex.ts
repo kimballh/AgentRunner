@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
-import { readLines, runProcess, streamToString } from "../process.js";
+import { attachAbortSignal, readLines, runProcess, signalSubprocess, streamToString } from "../process.js";
 import { redactSecrets } from "../redact.js";
 import type { ExecutionInput, ExecutionResult, ServiceConfig } from "../types.js";
 
@@ -50,7 +50,7 @@ async function runCodexExec(input: ExecutionInput): Promise<ExecutionResult> {
   const lastMessagePath = path.join(tempDir, "last-message.txt");
   try {
     const command = codexExecCommand(input, lastMessagePath);
-    const result = await runProcess(command, { cwd: input.cwd, stdin: input.prompt });
+    const result = await runProcess(command, { cwd: input.cwd, stdin: input.prompt, signal: input.signal });
     const threadId = parseExecThreadId(result.stdout) ?? input.sessionId;
     const lastMessage = await fs.readFile(lastMessagePath, "utf8").catch(() => "");
     const logs = combinedLogs(result.stdout, result.stderr);
@@ -88,7 +88,9 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
     cwd: input.cwd,
     env: process.env,
     stdio: ["pipe", "pipe", "pipe"],
+    detached: process.platform !== "win32",
   });
+  const detachAbort = attachAbortSignal(subprocess, input.signal);
   const closePromise = once(subprocess, "close").then(() => undefined);
 
   const stdoutLines: string[] = [];
@@ -243,6 +245,8 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
       sessionId: threadId,
       resumeUnavailable: Boolean(input.sessionId) && missingSessionMessage(error instanceof Error ? error.message : String(error)),
     };
+  } finally {
+    detachAbort();
   }
 }
 
@@ -290,7 +294,20 @@ async function stopAppServer(
   closePromise: Promise<void>,
   stderrPromise: Promise<string>,
 ): Promise<string> {
-  subprocess.kill();
+  signalSubprocess(subprocess, "SIGTERM");
+  let forceKillTimer: NodeJS.Timeout | undefined;
+  const closedGracefully = await Promise.race([
+    closePromise.then(() => true),
+    new Promise<false>((resolve) => {
+      forceKillTimer = setTimeout(() => resolve(false), 5_000);
+    }),
+  ]);
+  if (forceKillTimer) {
+    clearTimeout(forceKillTimer);
+  }
+  if (!closedGracefully) {
+    signalSubprocess(subprocess, "SIGKILL");
+  }
   await closePromise.catch(() => undefined);
   return stderrPromise.catch(() => "");
 }
