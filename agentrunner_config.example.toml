@@ -8,6 +8,7 @@ database_table = "agent_runs"
 agent_provider = "both"
 default_agent_provider = "codex"
 agent_mode = "exec"
+# Concurrent workers per enabled provider (two total when agent_provider = "both").
 num_workers = 1
 poll_frequency_ms = 60000
 stale_after_ms = 900000

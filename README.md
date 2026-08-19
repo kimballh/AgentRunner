@@ -84,8 +84,10 @@ Key settings:
 - `agent_mode`: `exec` or `app-server`; applies to Codex.
 - `database_url_env_var`: env var name to read the database URL from; default
   `AGENTRUNNER_DATABASE_URL`.
-- `num_workers`, `poll_frequency_ms`, `database_schema`, `database_table`,
-  `host`, and `port`.
+- `num_workers`: concurrent workers per enabled provider. With
+  `agent_provider = "both"`, setting this to `4` permits up to four Codex and four Claude runs
+  concurrently (eight total).
+- `poll_frequency_ms`, `database_schema`, `database_table`, `host`, and `port`.
 - `preflight_retries` defaults to `2` retries for transient Git, database, and
   system failures. `preflight_retry_delay_ms` defaults to `1000` and is used as
   the base for linear backoff.

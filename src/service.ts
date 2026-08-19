@@ -3,12 +3,21 @@ import { startDashboard, type DashboardServer } from "./dashboard.js";
 import { runAgent } from "./executors/index.js";
 import { runPreflightPhase } from "./preflight.js";
 import { AgentRunStore } from "./store.js";
-import type { ClaimedRun, ExecutionResult, ServiceConfig, WorkerStats, WorkspaceResult } from "./types.js";
+import type {
+  AgentProvider,
+  ClaimedRun,
+  ExecutionResult,
+  ServiceConfig,
+  WorkerStats,
+  WorkspaceResult,
+} from "./types.js";
 import { prepareReusedWorkspace, prepareWorkspace, runWorkspaceSetup, WorkspaceSetupError } from "./workspace.js";
 
 export class AgentRunnerService {
   private readonly store: AgentRunStore;
   private readonly workerIdPrefix = `agentrunner-${process.pid}-${randomUUID().slice(0, 8)}`;
+  private readonly providerActive: Record<AgentProvider, number> = { codex: 0, claude: 0 };
+  private readonly providerWaiters: Record<AgentProvider, Array<() => void>> = { codex: [], claude: [] };
   private active = 0;
   private queued = 0;
   private stopping = false;
@@ -28,13 +37,15 @@ export class AgentRunnerService {
     });
     console.log(`AgentRunner dashboard: ${this.dashboard.url}`);
 
-    for (let index = 0; index < this.config.numWorkers; index++) {
-      const workerId = `${this.workerIdPrefix}-${index + 1}`;
-      void this.workerLoop(workerId).catch((error) => {
-        if (!this.stopping) {
-          console.error(`Worker ${workerId} stopped unexpectedly: ${errorMessage(error)}`);
-        }
-      });
+    for (const provider of this.enabledProviders()) {
+      for (let index = 0; index < this.config.numWorkers; index++) {
+        const workerId = `${this.workerIdPrefix}-${provider}-${index + 1}`;
+        void this.workerLoop(workerId, provider).catch((error) => {
+          if (!this.stopping) {
+            console.error(`Worker ${workerId} stopped unexpectedly: ${errorMessage(error)}`);
+          }
+        });
+      }
     }
     this.pollTimer = setInterval(() => {
       void this.refreshQueued();
@@ -52,23 +63,28 @@ export class AgentRunnerService {
   }
 
   stats(): WorkerStats {
+    const maxWorkers = this.config.numWorkers * this.enabledProviders().length;
     return {
       active: this.active,
       queued: this.queued,
-      maxWorkers: this.config.numWorkers,
-      availableWorkers: Math.max(0, this.config.numWorkers - this.active),
+      maxWorkers,
+      availableWorkers: Math.max(0, maxWorkers - this.active),
     };
+  }
+
+  private enabledProviders(): AgentProvider[] {
+    return this.config.agentProvider === "both" ? ["codex", "claude"] : [this.config.agentProvider];
   }
 
   private async refreshQueued(): Promise<void> {
     this.queued = await this.store.countQueued().catch(() => this.queued);
   }
 
-  private async workerLoop(workerId: string): Promise<void> {
+  private async workerLoop(workerId: string, provider: AgentProvider): Promise<void> {
     while (!this.stopping) {
       let claimed;
       try {
-        claimed = await this.store.claimNext(workerId);
+        claimed = await this.store.claimNext(workerId, this.config.agentProvider === "both" ? provider : undefined);
       } catch (error) {
         this.logWorkerError(workerId, "claiming next run", error);
         await this.sleep(this.config.pollFrequencyMs);
@@ -118,14 +134,17 @@ export class AgentRunnerService {
         }
 
         workspace ??= await this.prepareFreshWorkspace(claimed, workerId);
+        const initialCwd = workspace.cwd;
 
-        let result = await runAgent({
-          prompt: claimed.row.prompt,
-          cwd: workspace.cwd,
-          resolved: claimed.resolved,
-          config: this.config,
-          sessionId: claimed.row.reused_from_run_id ? claimed.row.session_id ?? undefined : undefined,
-        });
+        let result = await this.withProviderSlot(claimed.resolved.provider, () =>
+          runAgent({
+            prompt: claimed.row.prompt,
+            cwd: initialCwd,
+            resolved: claimed.resolved,
+            config: this.config,
+            sessionId: claimed.row.reused_from_run_id ? claimed.row.session_id ?? undefined : undefined,
+          }),
+        );
         if (result.resumeUnavailable && claimed.row.reused_from_run_id) {
           claimed.row = await this.preflightPhase(
             workerId,
@@ -142,12 +161,15 @@ export class AgentRunnerService {
           );
           claimed.resolved = claimed.requested;
           workspace = await this.prepareFreshWorkspace(claimed, workerId);
-          result = await runAgent({
-            prompt: claimed.row.prompt,
-            cwd: workspace.cwd,
-            resolved: claimed.resolved,
-            config: this.config,
-          });
+          const fallbackCwd = workspace.cwd;
+          result = await this.withProviderSlot(claimed.resolved.provider, () =>
+            runAgent({
+              prompt: claimed.row.prompt,
+              cwd: fallbackCwd,
+              resolved: claimed.resolved,
+              config: this.config,
+            }),
+          );
         }
         result.workspace = workspace;
         if (workspace.setupLogs) {
@@ -245,6 +267,32 @@ export class AgentRunnerService {
 
   private logWorkerError(workerId: string, action: string, error: unknown): void {
     console.warn(`Worker ${workerId} error while ${action}: ${errorMessage(error)}`);
+  }
+
+  private async withProviderSlot<T>(provider: AgentProvider, operation: () => Promise<T>): Promise<T> {
+    await this.acquireProviderSlot(provider);
+    try {
+      return await operation();
+    } finally {
+      this.releaseProviderSlot(provider);
+    }
+  }
+
+  private async acquireProviderSlot(provider: AgentProvider): Promise<void> {
+    if (this.providerActive[provider] < this.config.numWorkers) {
+      this.providerActive[provider]++;
+      return;
+    }
+    await new Promise<void>((resolve) => this.providerWaiters[provider].push(resolve));
+  }
+
+  private releaseProviderSlot(provider: AgentProvider): void {
+    const next = this.providerWaiters[provider].shift();
+    if (next) {
+      next();
+      return;
+    }
+    this.providerActive[provider]--;
   }
 
   private preflightPhase<T>(workerId: string, runId: number, phase: string, operation: () => Promise<T>): Promise<T> {
