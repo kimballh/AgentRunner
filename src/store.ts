@@ -164,7 +164,7 @@ export class AgentRunStore {
   }
 
   async withWorktreeCleanupLock<T>(repoRoot: string, operation: () => Promise<T>): Promise<T> {
-    const lockName = `agentrunner:worktree-cleanup:${repoRoot}`;
+    const lockName = worktreeCleanupLockName(repoRoot);
     return this.withLocalCleanupLock(lockName, async () => {
       const client = await this.pool.connect();
       try {
@@ -243,8 +243,12 @@ export class AgentRunStore {
       }
 
       let requested;
+      let requestedBaseBranch: string | null | undefined;
       try {
-        requested = resolveRunConfig(row, this.config);
+        requested = row.requested_agent_provider
+          ? this.resolvePersistedRequestedConfig(row)
+          : resolveRunConfig(row, this.config);
+        requestedBaseBranch = row.requested_agent_provider ? row.requested_base_branch : row.base_branch;
         parseAgentProvider(requested.provider);
         parseAgentMode(requested.mode);
       } catch (error) {
@@ -265,12 +269,13 @@ export class AgentRunStore {
           return undefined;
         }
       } else if (row.reuse_session) {
-        const reusable = await client.query<AgentRunRow>(
-          `SELECT prior.*
+        const reusableRepo = await client.query<{ repo_path: string }>(
+          `SELECT prior.repo_path
            FROM ${this.table} AS prior
            WHERE prior.uid = $1
              AND prior.status = 'succeeded'
              AND prior.session_id IS NOT NULL
+             AND prior.repo_path IS NOT NULL
              AND prior.worktree_path IS NOT NULL
              AND prior.worktree_removed_at IS NULL
              AND NOT EXISTS (
@@ -280,10 +285,37 @@ export class AgentRunStore {
                  AND active.status IN ('queued', 'retry', 'running')
              )
            ORDER BY prior.finished_at DESC NULLS LAST, prior.id DESC
-           FOR UPDATE OF prior SKIP LOCKED
            LIMIT 1`,
           [row.uid],
         );
+        const reusableRepoPath = reusableRepo.rows[0]?.repo_path;
+        if (reusableRepoPath) {
+          await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))", [
+            worktreeCleanupLockName(reusableRepoPath),
+          ]);
+        }
+        const reusable = reusableRepoPath
+          ? await client.query<AgentRunRow>(
+              `SELECT prior.*
+               FROM ${this.table} AS prior
+               WHERE prior.uid = $1
+                 AND prior.repo_path = $2
+                 AND prior.status = 'succeeded'
+                 AND prior.session_id IS NOT NULL
+                 AND prior.worktree_path IS NOT NULL
+                 AND prior.worktree_removed_at IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM ${this.table} AS active
+                   WHERE active.session_id = prior.session_id
+                     AND active.status IN ('queued', 'retry', 'running')
+                 )
+               ORDER BY prior.finished_at DESC NULLS LAST, prior.id DESC
+               FOR UPDATE OF prior SKIP LOCKED
+               LIMIT 1`,
+              [row.uid, reusableRepoPath],
+            )
+          : { rows: [] as AgentRunRow[] };
         reuseSource = reusable.rows[0];
         if (reuseSource) {
           try {
@@ -317,7 +349,15 @@ export class AgentRunStore {
              worktree_path = COALESCE(worktree_path, $10),
              branch_name = COALESCE(branch_name, $11),
              base_branch = COALESCE($12, base_branch),
-             reuse_fallback_reason = $13
+             reuse_fallback_reason = $13,
+             requested_agent_provider = COALESCE(requested_agent_provider, $14),
+             requested_agent_mode = COALESCE(requested_agent_mode, $15),
+             requested_model_name = COALESCE(requested_model_name, $16),
+             requested_reasoning_effort = COALESCE(requested_reasoning_effort, $17),
+             requested_base_branch = CASE
+               WHEN requested_agent_provider IS NULL THEN $18
+               ELSE requested_base_branch
+             END
          WHERE id = $1
          RETURNING *`,
         [
@@ -334,10 +374,15 @@ export class AgentRunStore {
           reuseSource?.branch_name ?? null,
           reuseSource?.base_branch ?? null,
           reuseFallbackReason,
+          requested.provider,
+          requested.mode,
+          requested.modelName ?? null,
+          requested.reasoningEffort ?? null,
+          requestedBaseBranch ?? null,
         ],
       );
       await client.query("COMMIT");
-      return { row: updated.rows[0], resolved, requested, requestedBaseBranch: row.base_branch };
+      return { row: updated.rows[0], resolved, requested, requestedBaseBranch };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
@@ -539,7 +584,7 @@ export class AgentRunStore {
       throw new Error("reusable session is missing agent_provider");
     }
     const provider = parseAgentProvider(row.agent_provider);
-    const mode = provider === "codex" ? parseAgentMode(row.agent_mode ?? "exec") : "exec";
+    const mode = parseAgentMode(row.agent_mode ?? "exec");
     return {
       provider,
       mode,
@@ -547,6 +592,24 @@ export class AgentRunStore {
       reasoningEffort: row.reasoning_effort ?? undefined,
     };
   }
+
+  private resolvePersistedRequestedConfig(row: AgentRunRow): ClaimedRun["requested"] {
+    if (!row.requested_agent_provider) {
+      throw new Error("persisted requested configuration is missing agent_provider");
+    }
+    const provider = parseAgentProvider(row.requested_agent_provider);
+    const mode = parseAgentMode(row.requested_agent_mode ?? "exec");
+    return {
+      provider,
+      mode,
+      modelName: row.requested_model_name ?? undefined,
+      reasoningEffort: row.requested_reasoning_effort ?? undefined,
+    };
+  }
+}
+
+function worktreeCleanupLockName(repoRoot: string): string {
+  return `agentrunner:worktree-cleanup:${repoRoot}`;
 }
 
 export function errorToJson(error: unknown): Record<string, unknown> {

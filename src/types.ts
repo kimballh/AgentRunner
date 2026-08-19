@@ -99,6 +99,11 @@ export interface AgentRunRow {
   session_id?: string | null;
   reused_from_run_id?: number | null;
   reuse_fallback_reason?: string | null;
+  requested_agent_provider?: string | null;
+  requested_agent_mode?: string | null;
+  requested_model_name?: string | null;
+  requested_reasoning_effort?: string | null;
+  requested_base_branch?: string | null;
 }
 
 export interface RunListItem {

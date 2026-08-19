@@ -67,6 +67,11 @@ ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS reuse_session boolean not null def
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS session_id text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS reused_from_run_id integer;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS reuse_fallback_reason text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_agent_provider text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_agent_mode text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_model_name text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_reasoning_effort text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS requested_base_branch text;
 
 CREATE INDEX IF NOT EXISTS agent_runs_status_priority_idx
     ON ${table} (status, priority DESC, created_at ASC);
