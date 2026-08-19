@@ -4,6 +4,7 @@ import { qualifiedTable } from "./sql.js";
 import { resolveRunConfig } from "./selection.js";
 import type {
   AgentRunRow,
+  AgentProvider,
   ClaimedRun,
   CompletedRunForCleanup,
   ExecutionResult,
@@ -229,7 +230,7 @@ export class AgentRunStore {
     return result.rowCount ?? 0;
   }
 
-  async claimNext(workerId: string): Promise<ClaimedRun | undefined> {
+  async claimNext(workerId: string, provider?: AgentProvider): Promise<ClaimedRun | undefined> {
     const client = await this.pool.connect();
     let clientError: Error | undefined;
     const onClientError = (error: Error): void => {
@@ -241,11 +242,13 @@ export class AgentRunStore {
     try {
       await client.query("BEGIN");
       const selected = await client.query<AgentRunRow>(
-        `SELECT * FROM ${this.table}
-         WHERE status IN ('queued', 'retry')
-         ORDER BY priority DESC, created_at ASC
+        `SELECT candidate.* FROM ${this.table} AS candidate
+         WHERE candidate.status IN ('queued', 'retry')
+           AND ($1::text IS NULL OR ${this.claimProviderExpression()} = $1)
+         ORDER BY candidate.priority DESC, candidate.created_at ASC
          FOR UPDATE SKIP LOCKED
          LIMIT 1`,
+        [provider ?? null],
       );
       const row = selected.rows[0];
       if (!row) {
@@ -341,6 +344,13 @@ export class AgentRunStore {
         }
       }
 
+      // The provider expression above is a non-locking preview. Re-check after
+      // session leasing in case another transaction changed reuse availability.
+      if (provider && resolved.provider !== provider) {
+        await client.query("ROLLBACK");
+        return undefined;
+      }
+
       const updated = await client.query<AgentRunRow>(
         `UPDATE ${this.table}
          SET status = 'running',
@@ -401,6 +411,52 @@ export class AgentRunStore {
       client.removeListener("error", onClientError);
       client.release(clientError);
     }
+  }
+
+  private claimProviderExpression(): string {
+    const configuredProvider = `'${
+      this.config.agentProvider === "both" ? this.config.defaultAgentProvider : this.config.agentProvider
+    }'`;
+    const requestedProvider =
+      this.config.agentProvider === "both"
+        ? `CASE
+            WHEN COALESCE(candidate.requested_agent_provider, candidate.agent_provider) IN ('codex', 'claude')
+              THEN COALESCE(candidate.requested_agent_provider, candidate.agent_provider)
+            ELSE ${configuredProvider}
+          END`
+        : configuredProvider;
+
+    return `CASE
+      WHEN candidate.session_id IS NOT NULL THEN
+        CASE
+          WHEN candidate.agent_provider IN ('codex', 'claude') THEN candidate.agent_provider
+          ELSE ${requestedProvider}
+        END
+      WHEN candidate.reuse_session THEN COALESCE(
+        (
+          SELECT CASE
+                   WHEN prior.agent_provider IN ('codex', 'claude') THEN prior.agent_provider
+                 END
+          FROM ${this.table} AS prior
+          WHERE prior.uid = candidate.uid
+            AND prior.status = 'succeeded'
+            AND prior.session_id IS NOT NULL
+            AND prior.repo_path IS NOT NULL
+            AND prior.worktree_path IS NOT NULL
+            AND prior.worktree_removed_at IS NULL
+            AND NOT EXISTS (
+              SELECT 1
+              FROM ${this.table} AS active
+              WHERE active.session_id = prior.session_id
+                AND active.status IN ('queued', 'retry', 'running')
+            )
+          ORDER BY prior.finished_at DESC NULLS LAST, prior.id DESC
+          LIMIT 1
+        ),
+        ${requestedProvider}
+      )
+      ELSE ${requestedProvider}
+    END`;
   }
 
   async abandonSessionReuse(

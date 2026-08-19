@@ -85,7 +85,7 @@ function addConfigOptions(command: Command): Command {
     .option("--agent-provider <provider>", "codex, claude, or both")
     .option("--default-agent-provider <provider>", "codex or claude")
     .option("--agent-mode <mode>", "exec or app-server")
-    .option("--num-workers <count>", "Number of concurrent workers")
+    .option("--num-workers <count>", "Number of concurrent workers per enabled provider")
     .option("--poll-frequency <ms>", "Poll frequency in milliseconds")
     .option("--poll-frequency-ms <ms>", "Poll frequency in milliseconds")
     .option("--stale-after-ms <ms>", "Running job stale heartbeat threshold")

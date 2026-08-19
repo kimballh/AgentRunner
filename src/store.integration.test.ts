@@ -49,6 +49,27 @@ maybeDescribe("AgentRunStore integration", () => {
     expect(updated?.last_message).toBe("done");
   });
 
+  test("claims only runs assigned to a worker's provider", async () => {
+    await pool.query(
+      `INSERT INTO "${schema}"."agent_runs"
+       (status, raw_webhook_data, prompt, uid, created_at, priority, agent_provider)
+       VALUES
+       ('queued', '{}'::jsonb, 'provider codex', 'provider-codex', NOW(), 1002, 'codex'),
+       ('queued', '{}'::jsonb, 'provider claude', 'provider-claude', NOW(), 1001, 'claude')`,
+    );
+
+    const claude = await store.claimNext("claude-worker", "claude");
+    const codex = await store.claimNext("codex-worker", "codex");
+
+    expect(claude?.row.uid).toBe("provider-claude");
+    expect(claude?.resolved.provider).toBe("claude");
+    expect(codex?.row.uid).toBe("provider-codex");
+    expect(codex?.resolved.provider).toBe("codex");
+
+    await store.markSucceeded(claude!.row.id, "claude-worker", { exitCode: 0, logs: "done" });
+    await store.markSucceeded(codex!.row.id, "codex-worker", { exitCode: 0, logs: "done" });
+  });
+
   test("cancels a running job without retrying it", async () => {
     await pool.query(
       `INSERT INTO "${schema}"."agent_runs"
