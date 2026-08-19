@@ -51,7 +51,7 @@ async function runCodexExec(input: ExecutionInput): Promise<ExecutionResult> {
   try {
     const command = codexExecCommand(input, lastMessagePath);
     const result = await runProcess(command, { cwd: input.cwd, stdin: input.prompt });
-    const threadId = parseExecThreadId(result.stdout);
+    const threadId = parseExecThreadId(result.stdout) ?? input.sessionId;
     const lastMessage = await fs.readFile(lastMessagePath, "utf8").catch(() => "");
     const logs = combinedLogs(result.stdout, result.stderr);
 
@@ -63,6 +63,8 @@ async function runCodexExec(input: ExecutionInput): Promise<ExecutionResult> {
         conversation: jsonLines(result.stdout),
         logs,
         result: { provider: "codex", mode: "exec", failed: true },
+        sessionId: threadId,
+        resumeUnavailable: Boolean(input.sessionId) && missingSessionMessage(result.stderr),
       };
     }
 
@@ -73,6 +75,7 @@ async function runCodexExec(input: ExecutionInput): Promise<ExecutionResult> {
       conversation: jsonLines(result.stdout),
       logs,
       result: { provider: "codex", mode: "exec" },
+      sessionId: threadId,
     };
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -179,17 +182,28 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
     });
     send({ method: "initialized", params: {} });
 
-    const threadResult = await request("thread/start", {
-      model: input.resolved.modelName ?? null,
-      cwd: input.cwd,
-      approvalPolicy: input.config.codex.bypassApprovalsAndSandbox ? "never" : null,
-      sandbox: appServerSandbox(input.config),
-      config: input.resolved.reasoningEffort ? { model_reasoning_effort: input.resolved.reasoningEffort } : null,
-      serviceName: "agentrunner",
-      ephemeral: false,
-    });
-    const thread = isRecord(threadResult.thread) ? threadResult.thread : {};
-    threadId = stringValue(thread.id);
+    if (input.sessionId) {
+      await request("thread/resume", {
+        threadId: input.sessionId,
+        cwd: input.cwd,
+        model: input.resolved.modelName ?? null,
+        approvalPolicy: input.config.codex.bypassApprovalsAndSandbox ? "never" : null,
+        sandbox: appServerSandbox(input.config),
+      });
+      threadId = input.sessionId;
+    } else {
+      const threadResult = await request("thread/start", {
+        model: input.resolved.modelName ?? null,
+        cwd: input.cwd,
+        approvalPolicy: input.config.codex.bypassApprovalsAndSandbox ? "never" : null,
+        sandbox: appServerSandbox(input.config),
+        config: input.resolved.reasoningEffort ? { model_reasoning_effort: input.resolved.reasoningEffort } : null,
+        serviceName: "agentrunner",
+        ephemeral: false,
+      });
+      const thread = isRecord(threadResult.thread) ? threadResult.thread : {};
+      threadId = stringValue(thread.id);
+    }
     if (!threadId) {
       throw new Error("codex app-server did not return a thread id");
     }
@@ -210,6 +224,7 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
       conversation,
       logs: combinedLogs(redactSecrets(stdoutLines.join("\n")), stderr),
       result: { provider: "codex", mode: "app-server" },
+      sessionId: threadId,
     };
   } catch (error) {
     const stderr = redactSecrets(await stopAppServer(subprocess, closePromise, stderrPromise).catch(() => ""));
@@ -225,15 +240,23 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
         failed: true,
         message: error instanceof Error ? error.message : String(error),
       },
+      sessionId: threadId,
+      resumeUnavailable: Boolean(input.sessionId) && missingSessionMessage(error instanceof Error ? error.message : String(error)),
     };
   }
 }
 
 function codexExecCommand(input: ExecutionInput, lastMessagePath: string): string[] {
-  const command = [input.config.codex.bin, "exec", "--cd", input.cwd, "--output-last-message", lastMessagePath];
+  const command = [input.config.codex.bin, "exec"];
+  if (input.sessionId) {
+    command.push("resume", input.sessionId);
+  } else {
+    command.push("--cd", input.cwd);
+  }
+  command.push("--output-last-message", lastMessagePath);
   if (input.config.codex.bypassApprovalsAndSandbox) {
     command.push("--dangerously-bypass-approvals-and-sandbox");
-  } else if (input.config.codex.sandbox) {
+  } else if (input.config.codex.sandbox && !input.sessionId) {
     command.push("--sandbox", input.config.codex.sandbox);
   }
   if (input.resolved.modelName) {
@@ -245,6 +268,12 @@ function codexExecCommand(input: ExecutionInput, lastMessagePath: string): strin
   }
   command.push(...input.config.codex.extraArgs, "-");
   return command;
+}
+
+function missingSessionMessage(message: string): boolean {
+  return /(?:session|thread).*(?:not found|does not exist|unknown|failed to (?:load|resume))|no (?:session|thread)/i.test(
+    message,
+  );
 }
 
 function codexAppServerCommand(input: ExecutionInput): string[] {

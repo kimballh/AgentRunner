@@ -3,8 +3,8 @@ import { startDashboard, type DashboardServer } from "./dashboard.js";
 import { runAgent } from "./executors/index.js";
 import { runPreflightPhase } from "./preflight.js";
 import { AgentRunStore } from "./store.js";
-import type { ExecutionResult, ServiceConfig, WorkerStats, WorkspaceResult } from "./types.js";
-import { prepareWorkspace, runWorkspaceSetup, WorkspaceSetupError } from "./workspace.js";
+import type { ClaimedRun, ExecutionResult, ServiceConfig, WorkerStats, WorkspaceResult } from "./types.js";
+import { prepareReusedWorkspace, prepareWorkspace, runWorkspaceSetup, WorkspaceSetupError } from "./workspace.js";
 
 export class AgentRunnerService {
   private readonly store: AgentRunStore;
@@ -90,73 +90,71 @@ export class AgentRunnerService {
 
       let workspace: WorkspaceResult | undefined;
       try {
-        const cleanupEnabled = this.config.git.maxWorktrees > 0;
-        workspace = await prepareWorkspace({
-          config: this.config,
-          run: claimed.row,
-          completedRuns: [],
-          loadCleanupState: cleanupEnabled
-            ? async () => {
-                const completedRuns = await this.preflightPhase(
-                  workerId,
-                  claimed.row.id,
-                  "load cleanup candidates (database)",
-                  () => this.store.completedRunsOldestFirst(),
-                );
-                const recordedWorktreePaths = await this.preflightPhase(
-                  workerId,
-                  claimed.row.id,
-                  "load recorded worktree paths (database)",
-                  () => this.store.recordedWorktreePaths(),
-                );
-                return { completedRuns, recordedWorktreePaths };
-              }
-            : undefined,
-          withCleanupLock: cleanupEnabled
-            ? (repoRoot, operation) =>
-                this.preflightPhase(workerId, claimed.row.id, "acquire worktree cleanup lock (database)", () =>
-                  this.store.withWorktreeCleanupLock(repoRoot, operation),
-                )
-            : undefined,
-          onWorktreeRemoved: (id, note) =>
-            this.preflightPhase(workerId, claimed.row.id, "persist worktree cleanup (database)", () =>
-              this.store.markWorktreeRemoved(id, note),
-            ),
-        });
-        await this.preflightPhase(workerId, claimed.row.id, "persist workspace metadata (database)", () =>
-          this.store.recordWorkspace(claimed.row.id, workerId, workspace!),
+        const reuseRequested = Boolean(
+          claimed.row.session_id && claimed.row.reused_from_run_id && claimed.row.worktree_path,
         );
-
-        try {
-          const setupLogs = await this.preflightPhase(workerId, claimed.row.id, "workspace setup", () =>
-            runWorkspaceSetup(this.config, workspace!),
-          );
-          if (setupLogs) {
-            workspace.setupLogs = setupLogs;
-            await this.preflightPhase(workerId, claimed.row.id, "persist workspace setup logs (database)", () =>
+        if (reuseRequested) {
+          try {
+            workspace = await prepareReusedWorkspace({ config: this.config, run: claimed.row });
+            await this.preflightPhase(workerId, claimed.row.id, "persist reused workspace metadata (database)", () =>
               this.store.recordWorkspace(claimed.row.id, workerId, workspace!),
             );
-          }
-        } catch (error) {
-          const setupError = findWorkspaceSetupError(error);
-          if (setupError) {
-            workspace.setupLogs = setupError.setupLogs;
-            await this.preflightPhase(workerId, claimed.row.id, "persist failed workspace setup logs (database)", () =>
-              this.store.recordWorkspace(claimed.row.id, workerId, workspace!),
+          } catch (error) {
+            claimed.row = await this.preflightPhase(
+              workerId,
+              claimed.row.id,
+              "record session reuse fallback (database)",
+              () =>
+                this.store.abandonSessionReuse(
+                  claimed.row.id,
+                  workerId,
+                  claimed.requested,
+                  claimed.requestedBaseBranch,
+                  `reusable workspace unavailable: ${errorMessage(error)}`,
+                ),
             );
+            claimed.resolved = claimed.requested;
           }
-          throw error;
         }
 
-        const result = await runAgent({
+        workspace ??= await this.prepareFreshWorkspace(claimed, workerId);
+
+        let result = await runAgent({
           prompt: claimed.row.prompt,
           cwd: workspace.cwd,
           resolved: claimed.resolved,
           config: this.config,
+          sessionId: claimed.row.reused_from_run_id ? claimed.row.session_id ?? undefined : undefined,
         });
+        if (result.resumeUnavailable && claimed.row.reused_from_run_id) {
+          claimed.row = await this.preflightPhase(
+            workerId,
+            claimed.row.id,
+            "record missing session fallback (database)",
+            () =>
+              this.store.abandonSessionReuse(
+                claimed.row.id,
+                workerId,
+                claimed.requested,
+                claimed.requestedBaseBranch,
+                "provider could not resume the retained session",
+              ),
+          );
+          claimed.resolved = claimed.requested;
+          workspace = await this.prepareFreshWorkspace(claimed, workerId);
+          result = await runAgent({
+            prompt: claimed.row.prompt,
+            cwd: workspace.cwd,
+            resolved: claimed.resolved,
+            config: this.config,
+          });
+        }
         result.workspace = workspace;
         if (workspace.setupLogs) {
           result.logs = `${workspace.setupLogs}\n${result.logs}`;
+        }
+        if (workspace.reuseLogs) {
+          result.logs = `--- session reuse workspace refresh ---\n${workspace.reuseLogs}\n${result.logs}`;
         }
         if (result.exitCode === 0) {
           await this.store.markSucceeded(claimed.row.id, workerId, result);
@@ -182,6 +180,67 @@ export class AgentRunnerService {
         await this.refreshQueued();
       }
     }
+  }
+
+  private async prepareFreshWorkspace(claimed: ClaimedRun, workerId: string): Promise<WorkspaceResult> {
+    const cleanupEnabled = this.config.git.maxWorktrees > 0;
+    const workspace = await prepareWorkspace({
+      config: this.config,
+      run: claimed.row,
+      completedRuns: [],
+      loadCleanupState: cleanupEnabled
+        ? async () => {
+            const completedRuns = await this.preflightPhase(
+              workerId,
+              claimed.row.id,
+              "load cleanup candidates (database)",
+              () => this.store.completedRunsOldestFirst(),
+            );
+            const recordedWorktreePaths = await this.preflightPhase(
+              workerId,
+              claimed.row.id,
+              "load recorded worktree paths (database)",
+              () => this.store.recordedWorktreePaths(),
+            );
+            return { completedRuns, recordedWorktreePaths };
+          }
+        : undefined,
+      withCleanupLock: cleanupEnabled
+        ? (repoRoot, operation) =>
+            this.preflightPhase(workerId, claimed.row.id, "acquire worktree cleanup lock (database)", () =>
+              this.store.withWorktreeCleanupLock(repoRoot, operation),
+            )
+        : undefined,
+      onWorktreeRemoved: (id, note) =>
+        this.preflightPhase(workerId, claimed.row.id, "persist worktree cleanup (database)", () =>
+          this.store.markWorktreeRemoved(id, note),
+        ),
+    });
+    await this.preflightPhase(workerId, claimed.row.id, "persist workspace metadata (database)", () =>
+      this.store.recordWorkspace(claimed.row.id, workerId, workspace),
+    );
+
+    try {
+      const setupLogs = await this.preflightPhase(workerId, claimed.row.id, "workspace setup", () =>
+        runWorkspaceSetup(this.config, workspace),
+      );
+      if (setupLogs) {
+        workspace.setupLogs = setupLogs;
+        await this.preflightPhase(workerId, claimed.row.id, "persist workspace setup logs (database)", () =>
+          this.store.recordWorkspace(claimed.row.id, workerId, workspace),
+        );
+      }
+    } catch (error) {
+      const setupError = findWorkspaceSetupError(error);
+      if (setupError) {
+        workspace.setupLogs = setupError.setupLogs;
+        await this.preflightPhase(workerId, claimed.row.id, "persist failed workspace setup logs (database)", () =>
+          this.store.recordWorkspace(claimed.row.id, workerId, workspace),
+        );
+      }
+      throw error;
+    }
+    return workspace;
   }
 
   private logWorkerError(workerId: string, action: string, error: unknown): void {

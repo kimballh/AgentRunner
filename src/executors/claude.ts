@@ -5,6 +5,7 @@ export async function runClaude(input: ExecutionInput): Promise<ExecutionResult>
   const command = claudeCommand(input);
   const result = await runProcess(command, { cwd: input.cwd, stdin: input.prompt });
   const parsed = parseClaudeOutput(result.stdout);
+  const sessionId = sessionIdFrom(parsed) ?? input.sessionId;
   const logs = [`--- stdout ---\n${result.stdout}`, `--- stderr ---\n${result.stderr}`].join("\n");
 
   return {
@@ -18,11 +19,21 @@ export async function runClaude(input: ExecutionInput): Promise<ExecutionResult>
       parsed,
       failed: result.exitCode !== 0,
     },
+    sessionId,
+    resumeUnavailable:
+      Boolean(input.sessionId) &&
+      result.exitCode !== 0 &&
+      /(?:session|conversation).*(?:not found|does not exist|unknown|failed to (?:load|resume))|no (?:session|conversation)/i.test(
+        `${result.stderr}\n${result.stdout}`,
+      ),
   };
 }
 
 function claudeCommand(input: ExecutionInput): string[] {
   const command = [input.config.claude.bin, "-p", "--output-format", "json"];
+  if (input.sessionId) {
+    command.push("--resume", input.sessionId);
+  }
   if (input.resolved.modelName) {
     command.push("--model", input.resolved.modelName);
   }
@@ -34,6 +45,15 @@ function claudeCommand(input: ExecutionInput): string[] {
   }
   command.push(...input.config.claude.extraArgs);
   return command;
+}
+
+export function sessionIdFrom(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const sessionId = record.session_id ?? record.sessionId;
+  return typeof sessionId === "string" && sessionId.trim() ? sessionId : undefined;
 }
 
 function parseClaudeOutput(stdout: string): unknown {

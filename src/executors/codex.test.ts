@@ -15,6 +15,41 @@ describe("codex executor helpers", () => {
     expect(threadUrl("thread with spaces")).toBe("codex://threads/thread%20with%20spaces");
   });
 
+  test("resumes a saved exec session instead of creating a new thread", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "agentrunner-codex-resume-test-"));
+    const fakeCodexBin = path.join(tempDir, "fake-codex-resume.js");
+    await fs.writeFile(
+      fakeCodexBin,
+      `#!/usr/bin/env node
+import fs from "node:fs";
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf("--output-last-message");
+if (outputIndex >= 0) fs.writeFileSync(args[outputIndex + 1], "resumed");
+process.stderr.write(JSON.stringify(args));
+process.stdout.write(JSON.stringify({ type: "turn.completed" }) + "\\n");
+`,
+      { mode: 0o755 },
+    );
+
+    try {
+      const result = await runCodex({
+        prompt: "test again",
+        cwd: tempDir,
+        sessionId: "019-session",
+        resolved: { provider: "codex", mode: "exec", modelName: "gpt-5.6-sol" },
+        config: testConfig(fakeCodexBin, tempDir),
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.sessionId).toBe("019-session");
+      expect(result.link).toBe("codex://threads/019-session");
+      expect(result.logs).toContain('["exec","resume","019-session"');
+      expect(result.logs).not.toContain('"--cd"');
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   test("stops long-lived app-server after turn completion", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "agentrunner-codex-test-"));
     const fakeCodexBin = path.join(tempDir, "fake-codex-app-server.js");

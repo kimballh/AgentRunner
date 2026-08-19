@@ -96,6 +96,122 @@ export async function prepareWorkspace(input: WorkspacePreparationInput): Promis
   };
 }
 
+export async function prepareReusedWorkspace(input: {
+  config: ServiceConfig;
+  run: AgentRunRow;
+  runner?: WorkspaceCommandRunner;
+}): Promise<WorkspaceResult> {
+  const runner = input.runner ?? defaultWorkspaceRunner;
+  const worktreePath = input.run.worktree_path ? path.resolve(input.run.worktree_path) : undefined;
+  if (!worktreePath || !input.run.session_id || !input.run.reused_from_run_id) {
+    throw new Error("reusable run is missing its session or worktree metadata");
+  }
+
+  const repo = await workspacePhase(input.config, "resolve reusable Git repository", () =>
+    resolveRepo(input.config, runner),
+  );
+  if (!repo.enabled) {
+    throw new Error("session reuse requires Git worktrees to be enabled");
+  }
+  if (input.run.repo_path && path.resolve(input.run.repo_path) !== path.resolve(repo.root)) {
+    throw new Error("reusable worktree belongs to a different Git repository");
+  }
+  const worktreeRoot = resolveConfiguredPath(input.config.git.worktreeDir, repo.root);
+  if (!isPathInside(worktreePath, worktreeRoot)) {
+    throw new Error("reusable worktree is outside the configured worktree directory");
+  }
+  if (!(await pathExists(worktreePath))) {
+    throw new Error("reusable worktree path no longer exists");
+  }
+
+  const listed = await workspacePhase(input.config, "list reusable Git worktrees", () =>
+    runner.run(["git", "worktree", "list", "--porcelain"], {
+      cwd: repo.root,
+      label: "list registered worktrees for reuse",
+    }),
+  );
+  const registered = parseWorktreeList(listed.stdout).some((item) => path.resolve(item.path) === worktreePath);
+  if (!registered) {
+    throw new Error("reusable worktree is no longer registered with Git");
+  }
+
+  const topLevel = await workspacePhase(input.config, "verify reusable Git worktree", () =>
+    runner.run(["git", "rev-parse", "--show-toplevel"], {
+      cwd: worktreePath,
+      label: "verify reusable worktree",
+    }),
+  );
+  if (topLevel.stdout.trim() && path.resolve(topLevel.stdout.trim()) !== worktreePath) {
+    throw new Error("reusable worktree resolves to an unexpected Git root");
+  }
+
+  const refreshLogs: string[] = [];
+  await bestEffortWorkspaceCommand(
+    runner,
+    ["git", "fetch", input.config.git.remote],
+    repo.root,
+    "fetch reusable worktree remote",
+    refreshLogs,
+  );
+  const status = await workspacePhase(input.config, "check reusable worktree status", () =>
+    runner.run(["git", "status", "--porcelain"], {
+      cwd: worktreePath,
+      label: "check reusable worktree status",
+    }),
+  );
+  if (status.stdout.trim()) {
+    refreshLogs.push("Skipped fast-forward because the reusable worktree has local changes.");
+  } else {
+    const upstream = await bestEffortWorkspaceCommand(
+      runner,
+      ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+      worktreePath,
+      "resolve reusable worktree upstream",
+      refreshLogs,
+    );
+    if (upstream?.stdout.trim()) {
+      await bestEffortWorkspaceCommand(
+        runner,
+        ["git", "merge", "--ff-only", "@{u}"],
+        worktreePath,
+        "fast-forward reusable worktree",
+        refreshLogs,
+      );
+    }
+  }
+
+  return {
+    cwd: worktreePath,
+    repoPath: repo.root,
+    worktreePath,
+    branchName: input.run.branch_name ?? undefined,
+    baseBranch: input.run.base_branch ?? undefined,
+    reuseLogs: refreshLogs.join("\n") || undefined,
+  };
+}
+
+async function bestEffortWorkspaceCommand(
+  runner: WorkspaceCommandRunner,
+  command: string[],
+  cwd: string,
+  label: string,
+  logs: string[],
+): Promise<ProcessResult | undefined> {
+  try {
+    const result = await runner.run(command, { cwd, label });
+    if (result.stdout.trim()) {
+      logs.push(`${label}: ${result.stdout.trim()}`);
+    }
+    if (result.stderr.trim()) {
+      logs.push(`${label}: ${result.stderr.trim()}`);
+    }
+    return result;
+  } catch (error) {
+    logs.push(`${label} skipped: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+}
+
 export async function runWorkspaceSetup(config: ServiceConfig, workspace: WorkspaceResult): Promise<string | undefined> {
   if (!workspace.worktreePath || config.git.setup === "never") {
     return undefined;

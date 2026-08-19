@@ -92,6 +92,71 @@ maybeDescribe("AgentRunStore integration", () => {
 
     expect(maxActive).toBe(1);
   });
+
+  test("claims the latest successful matching session with its original provider configuration", async () => {
+    const source = await pool.query<{ id: number }>(
+      `INSERT INTO "${schema}"."agent_runs"
+       (status, raw_webhook_data, prompt, uid, created_at, finished_at, priority,
+        agent_provider, agent_mode, model_name, reasoning_effort, session_id,
+        repo_path, worktree_path, branch_name, base_branch)
+       VALUES
+       ('succeeded', '{}'::jsonb, 'first test', 'HAR-900::Bot Testing', NOW() - INTERVAL '1 minute', NOW(), 0,
+        'claude', 'exec', 'claude-opus-5', 'high', 'session-har-900',
+        '/tmp/repo', '/tmp/repo/.worktrees/test', 'agentrunner/test', 'origin/project')
+       RETURNING id`,
+    );
+    await pool.query(
+      `INSERT INTO "${schema}"."agent_runs"
+       (status, raw_webhook_data, prompt, uid, created_at, priority, reuse_session,
+        agent_provider, model_name)
+       VALUES
+       ('queued', '{}'::jsonb, 'test again', 'HAR-900::Bot Testing', NOW(), 100, true,
+        'codex', 'gpt-5.6-sol')`,
+    );
+
+    const claimed = await store.claimNext("reuse-worker");
+
+    expect(claimed?.row.reused_from_run_id).toBe(source.rows[0].id);
+    expect(claimed?.row.session_id).toBe("session-har-900");
+    expect(claimed?.row.worktree_path).toBe("/tmp/repo/.worktrees/test");
+    expect(claimed?.resolved).toMatchObject({ provider: "claude", modelName: "claude-opus-5", reasoningEffort: "high" });
+    expect(claimed?.requested).toMatchObject({ provider: "codex", modelName: "gpt-5.6-sol" });
+    expect((await store.completedRunsOldestFirst()).map((run) => run.worktree_path)).not.toContain(
+      "/tmp/repo/.worktrees/test",
+    );
+
+    await store.markSucceeded(claimed!.row.id, "reuse-worker", {
+      exitCode: 0,
+      sessionId: "session-har-900",
+      logs: "resumed",
+    });
+  });
+
+  test("does not lease one reusable session to two active runs", async () => {
+    await pool.query(
+      `INSERT INTO "${schema}"."agent_runs"
+       (status, raw_webhook_data, prompt, uid, created_at, finished_at, priority,
+        agent_provider, agent_mode, session_id, repo_path, worktree_path)
+       VALUES
+       ('succeeded', '{}'::jsonb, 'source', 'HAR-901::Bot Testing', NOW() - INTERVAL '1 minute', NOW(), 0,
+        'codex', 'exec', 'session-har-901', '/tmp/repo', '/tmp/repo/.worktrees/test-901');
+       INSERT INTO "${schema}"."agent_runs"
+       (status, raw_webhook_data, prompt, uid, created_at, priority, reuse_session)
+       VALUES
+       ('queued', '{}'::jsonb, 'one', 'HAR-901::Bot Testing', NOW(), 90, true),
+       ('queued', '{}'::jsonb, 'two', 'HAR-901::Bot Testing', NOW() + INTERVAL '1 millisecond', 90, true)`,
+    );
+
+    const first = await store.claimNext("lease-worker-1");
+    const second = await store.claimNext("lease-worker-2");
+
+    expect(first?.row.session_id).toBe("session-har-901");
+    expect(second?.row.session_id).toBeNull();
+    expect(second?.row.reuse_fallback_reason).toContain("no available successful run");
+
+    await store.markSucceeded(first!.row.id, "lease-worker-1", { exitCode: 0, logs: "done" });
+    await store.markSucceeded(second!.row.id, "lease-worker-2", { exitCode: 0, sessionId: "fresh-901", logs: "done" });
+  });
 });
 
 function serviceConfig(url: string, databaseSchema: string): ServiceConfig {

@@ -102,6 +102,10 @@ export class AgentRunStore {
               branch_name,
               base_branch,
               cleanup_note,
+              reuse_session,
+              session_id,
+              reused_from_run_id,
+              reuse_fallback_reason,
               error IS NOT NULL AS has_error,
               logs IS NOT NULL AND logs <> '' AS has_logs,
               setup_logs IS NOT NULL AND setup_logs <> '' AS has_setup_logs,
@@ -124,22 +128,34 @@ export class AgentRunStore {
 
   async completedRunsOldestFirst(): Promise<CompletedRunForCleanup[]> {
     const result = await this.pool.query<CompletedRunForCleanup>(
-      `SELECT id,
-              worktree_path,
-              branch_name,
-              status
-       FROM ${this.table}
-       WHERE worktree_path IS NOT NULL
-         AND worktree_removed_at IS NULL
-         AND status IN ('succeeded', 'failed')
-       ORDER BY COALESCE(finished_at, updated_at, created_at) ASC, id ASC`,
+      `SELECT id, worktree_path, branch_name, status
+       FROM (
+         SELECT DISTINCT ON (worktree_path)
+                id,
+                worktree_path,
+                branch_name,
+                status,
+                COALESCE(finished_at, updated_at, created_at) AS completed_at
+         FROM ${this.table} AS completed
+         WHERE completed.worktree_path IS NOT NULL
+           AND completed.worktree_removed_at IS NULL
+           AND completed.status IN ('succeeded', 'failed')
+           AND NOT EXISTS (
+             SELECT 1
+             FROM ${this.table} AS active
+             WHERE active.worktree_path = completed.worktree_path
+               AND active.status IN ('queued', 'retry', 'running')
+           )
+         ORDER BY worktree_path, COALESCE(finished_at, updated_at, created_at) DESC, id DESC
+       ) AS latest_per_worktree
+       ORDER BY completed_at ASC, id ASC`,
     );
     return result.rows;
   }
 
   async recordedWorktreePaths(): Promise<string[]> {
     const result = await this.pool.query<{ worktree_path: string }>(
-      `SELECT worktree_path
+      `SELECT DISTINCT worktree_path
        FROM ${this.table}
        WHERE worktree_path IS NOT NULL
          AND worktree_removed_at IS NULL`,
@@ -172,7 +188,8 @@ export class AgentRunStore {
        SET worktree_removed_at = COALESCE(worktree_removed_at, NOW()),
            cleanup_note = COALESCE(cleanup_note, $2),
            updated_at = NOW()
-       WHERE id = $1`,
+       WHERE worktree_path = (SELECT worktree_path FROM ${this.table} WHERE id = $1)
+         AND worktree_removed_at IS NULL`,
       [id, note],
     );
   }
@@ -225,15 +242,60 @@ export class AgentRunStore {
         return undefined;
       }
 
-      let resolved;
+      let requested;
       try {
-        resolved = resolveRunConfig(row, this.config);
-        parseAgentProvider(resolved.provider);
-        parseAgentMode(resolved.mode);
+        requested = resolveRunConfig(row, this.config);
+        parseAgentProvider(requested.provider);
+        parseAgentMode(requested.mode);
       } catch (error) {
         await this.markInvalidClaim(client, row, error);
         await client.query("COMMIT");
         return undefined;
+      }
+
+      let reuseSource: AgentRunRow | undefined;
+      let resolved = requested;
+      let reuseFallbackReason: string | null = row.reuse_fallback_reason ?? null;
+      if (row.session_id) {
+        try {
+          resolved = this.resolvePersistedSessionConfig(row);
+        } catch (error) {
+          await this.markInvalidClaim(client, row, error);
+          await client.query("COMMIT");
+          return undefined;
+        }
+      } else if (row.reuse_session) {
+        const reusable = await client.query<AgentRunRow>(
+          `SELECT prior.*
+           FROM ${this.table} AS prior
+           WHERE prior.uid = $1
+             AND prior.status = 'succeeded'
+             AND prior.session_id IS NOT NULL
+             AND prior.worktree_path IS NOT NULL
+             AND prior.worktree_removed_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1
+               FROM ${this.table} AS active
+               WHERE active.session_id = prior.session_id
+                 AND active.status IN ('queued', 'retry', 'running')
+             )
+           ORDER BY prior.finished_at DESC NULLS LAST, prior.id DESC
+           FOR UPDATE OF prior SKIP LOCKED
+           LIMIT 1`,
+          [row.uid],
+        );
+        reuseSource = reusable.rows[0];
+        if (reuseSource) {
+          try {
+            resolved = this.resolvePersistedSessionConfig(reuseSource);
+            reuseFallbackReason = null;
+          } catch {
+            reuseSource = undefined;
+            reuseFallbackReason = "latest matching run has invalid persisted provider configuration";
+          }
+        } else {
+          reuseFallbackReason = "no available successful run with the same uid and a retained session worktree";
+        }
       }
 
       const updated = await client.query<AgentRunRow>(
@@ -248,13 +310,34 @@ export class AgentRunStore {
              agent_provider = $3,
              agent_mode = $4,
              model_name = $5,
-             reasoning_effort = $6
+             reasoning_effort = $6,
+             session_id = COALESCE(session_id, $7),
+             reused_from_run_id = COALESCE(reused_from_run_id, $8),
+             repo_path = COALESCE(repo_path, $9),
+             worktree_path = COALESCE(worktree_path, $10),
+             branch_name = COALESCE(branch_name, $11),
+             base_branch = COALESCE($12, base_branch),
+             reuse_fallback_reason = $13
          WHERE id = $1
          RETURNING *`,
-        [row.id, workerId, resolved.provider, resolved.mode, resolved.modelName ?? null, resolved.reasoningEffort ?? null],
+        [
+          row.id,
+          workerId,
+          resolved.provider,
+          resolved.mode,
+          resolved.modelName ?? null,
+          resolved.reasoningEffort ?? null,
+          reuseSource?.session_id ?? null,
+          reuseSource?.id ?? null,
+          reuseSource?.repo_path ?? null,
+          reuseSource?.worktree_path ?? null,
+          reuseSource?.branch_name ?? null,
+          reuseSource?.base_branch ?? null,
+          reuseFallbackReason,
+        ],
       );
       await client.query("COMMIT");
-      return { row: updated.rows[0], resolved };
+      return { row: updated.rows[0], resolved, requested, requestedBaseBranch: row.base_branch };
     } catch (error) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw error;
@@ -262,6 +345,50 @@ export class AgentRunStore {
       client.removeListener("error", onClientError);
       client.release(clientError);
     }
+  }
+
+  async abandonSessionReuse(
+    id: number,
+    workerId: string,
+    requested: ClaimedRun["requested"],
+    requestedBaseBranch: string | null | undefined,
+    reason: string,
+  ): Promise<AgentRunRow> {
+    const result = await this.pool.query<AgentRunRow>(
+      `UPDATE ${this.table}
+       SET agent_provider = $3,
+           agent_mode = $4,
+           model_name = $5,
+           reasoning_effort = $6,
+           session_id = NULL,
+           reused_from_run_id = NULL,
+           repo_path = NULL,
+           worktree_path = NULL,
+           branch_name = NULL,
+           base_branch = $7,
+           setup_logs = NULL,
+           cleanup_note = NULL,
+           worktree_removed_at = NULL,
+           reuse_fallback_reason = $8,
+           updated_at = NOW()
+       WHERE id = $1 AND locked_by = $2 AND status = 'running'
+       RETURNING *`,
+      [
+        id,
+        workerId,
+        requested.provider,
+        requested.mode,
+        requested.modelName ?? null,
+        requested.reasoningEffort ?? null,
+        requestedBaseBranch ?? null,
+        reason,
+      ],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new Error(`run ${id} was no longer owned by ${workerId} while abandoning session reuse`);
+    }
+    return row;
   }
 
   async heartbeat(id: number, workerId: string): Promise<void> {
@@ -310,8 +437,9 @@ export class AgentRunStore {
            logs = $6,
            result = $7::jsonb,
            exit_code = $8,
-           setup_logs = COALESCE($9, setup_logs),
-           cleanup_note = COALESCE($10, cleanup_note),
+           session_id = COALESCE($9, session_id),
+           setup_logs = COALESCE($10, setup_logs),
+           cleanup_note = COALESCE($11, cleanup_note),
            error = NULL,
            locked_by = NULL,
            locked_at = NULL,
@@ -326,6 +454,7 @@ export class AgentRunStore {
         result.logs,
         JSON.stringify(result.result ?? null),
         result.exitCode,
+        result.sessionId ?? null,
         result.workspace?.setupLogs ?? null,
         result.workspace?.cleanupNote ?? null,
       ],
@@ -347,9 +476,10 @@ export class AgentRunStore {
            logs = COALESCE($7, logs),
            result = COALESCE($8::jsonb, result),
            exit_code = $9,
-           error = $10::jsonb,
-           setup_logs = COALESCE($11, setup_logs),
-           cleanup_note = COALESCE($12, cleanup_note),
+           session_id = COALESCE($10, session_id),
+           error = $11::jsonb,
+           setup_logs = COALESCE($12, setup_logs),
+           cleanup_note = COALESCE($13, cleanup_note),
            locked_by = NULL,
            locked_at = NULL,
            heartbeat_at = NULL
@@ -364,6 +494,7 @@ export class AgentRunStore {
         result?.logs ?? null,
         result?.result === undefined ? null : JSON.stringify(result.result),
         result?.exitCode ?? 1,
+        result?.sessionId ?? null,
         JSON.stringify(errorToJson(error)),
         result?.workspace?.setupLogs ?? null,
         result?.workspace?.cleanupNote ?? null,
@@ -401,6 +532,20 @@ export class AgentRunStore {
         this.localCleanupLocks.delete(key);
       }
     }
+  }
+
+  private resolvePersistedSessionConfig(row: AgentRunRow): ClaimedRun["resolved"] {
+    if (!row.agent_provider) {
+      throw new Error("reusable session is missing agent_provider");
+    }
+    const provider = parseAgentProvider(row.agent_provider);
+    const mode = provider === "codex" ? parseAgentMode(row.agent_mode ?? "exec") : "exec";
+    return {
+      provider,
+      mode,
+      modelName: row.model_name ?? undefined,
+      reasoningEffort: row.reasoning_effort ?? undefined,
+    };
   }
 }
 

@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { CommandError } from "./process.js";
-import { prepareWorkspace, runWorkspaceSetup, type WorkspaceCommandRunner } from "./workspace.js";
+import {
+  prepareReusedWorkspace,
+  prepareWorkspace,
+  runWorkspaceSetup,
+  type WorkspaceCommandRunner,
+} from "./workspace.js";
 import type { AgentRunRow, CompletedRunForCleanup, ServiceConfig } from "./types.js";
 
 describe("workspace", () => {
@@ -370,10 +375,80 @@ describe("workspace", () => {
 
     expect(logs).toContain("setup-ran");
   });
+
+  test("reuses a registered clean worktree and fast-forwards its upstream", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const worktree = path.join(repo, ".worktrees", "bot-testing");
+    await fs.mkdir(worktree, { recursive: true });
+    const runner = recordingRunner({
+      worktreeList: [`worktree ${repo}`, "branch refs/heads/main", "", `worktree ${worktree}`, "branch refs/heads/agentrunner/test", ""].join("\n"),
+      topLevel: worktree,
+    });
+
+    const workspace = await prepareReusedWorkspace({
+      config: serviceConfig({ cwd, git: { ...gitConfig(), repo } }),
+      run: row({
+        session_id: "session-1",
+        reused_from_run_id: 17,
+        repo_path: repo,
+        worktree_path: worktree,
+        branch_name: "agentrunner/test",
+      }),
+      runner,
+    });
+
+    expect(workspace.cwd).toBe(worktree);
+    expect(runner.commands.map((item) => item.command.join(" "))).toEqual(
+      expect.arrayContaining(["git fetch origin", "git merge --ff-only @{u}"]),
+    );
+  });
+
+  test("reuses a dirty worktree without pulling into it", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const worktree = path.join(repo, ".worktrees", "bot-testing");
+    await fs.mkdir(worktree, { recursive: true });
+    const runner = recordingRunner({
+      worktreeList: `worktree ${worktree}\nbranch refs/heads/agentrunner/test\n`,
+      topLevel: worktree,
+      dirtyStatus: " M src/file.ts\n",
+    });
+
+    const workspace = await prepareReusedWorkspace({
+      config: serviceConfig({ cwd, git: { ...gitConfig(), repo } }),
+      run: row({ session_id: "session-1", reused_from_run_id: 17, repo_path: repo, worktree_path: worktree }),
+      runner,
+    });
+
+    expect(workspace.reuseLogs).toContain("Skipped fast-forward");
+    expect(runner.commands.map((item) => item.command.join(" "))).not.toContain("git merge --ff-only @{u}");
+  });
+
+  test("rejects reuse when Git no longer registers the worktree", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const worktree = path.join(repo, ".worktrees", "bot-testing");
+    await fs.mkdir(worktree, { recursive: true });
+
+    await expect(
+      prepareReusedWorkspace({
+        config: serviceConfig({ cwd, git: { ...gitConfig(), repo } }),
+        run: row({ session_id: "session-1", reused_from_run_id: 17, repo_path: repo, worktree_path: worktree }),
+        runner: recordingRunner({ worktreeList: `worktree ${repo}\nbranch refs/heads/main\n` }),
+      }),
+    ).rejects.toThrow("no longer registered");
+  });
 });
 
 function recordingRunner(
-  options: { defaultStdout?: string; worktreeList?: string; transientFetchFailures?: number } = {},
+  options: {
+    defaultStdout?: string;
+    worktreeList?: string;
+    transientFetchFailures?: number;
+    topLevel?: string;
+    dirtyStatus?: string;
+  } = {},
 ): WorkspaceCommandRunner & {
   commands: Array<{ command: string[]; cwd: string; label: string }>;
 } {
@@ -388,6 +463,12 @@ function recordingRunner(
       }
       if (command.join(" ") === "git worktree list --porcelain") {
         return { exitCode: 0, stdout: options.worktreeList ?? "", stderr: "" };
+      }
+      if (command.join(" ") === "git rev-parse --show-toplevel") {
+        return { exitCode: 0, stdout: options.topLevel ? `${options.topLevel}\n` : "", stderr: "" };
+      }
+      if (command.join(" ") === "git status --porcelain") {
+        return { exitCode: 0, stdout: options.dirtyStatus ?? "", stderr: "" };
       }
       if (command.join(" ") === "git fetch origin" && transientFetchFailures > 0) {
         transientFetchFailures--;
