@@ -1,5 +1,5 @@
 import { Pool, type PoolClient } from "pg";
-import { parseAgentMode, parseAgentProvider } from "./config.js";
+import { parseAgentMode, parseAgentProvider, parseRunWorkspaceMode } from "./config.js";
 import { qualifiedTable } from "./sql.js";
 import { resolveRunConfig } from "./selection.js";
 import type {
@@ -8,6 +8,7 @@ import type {
   ClaimedRun,
   CompletedRunForCleanup,
   ExecutionResult,
+  RunWorkspaceMode,
   RunListItem,
   ServiceConfig,
   WorkspaceResult,
@@ -107,6 +108,7 @@ export class AgentRunStore {
               updated_at,
               repo_path,
               worktree_path,
+              workspace_mode,
               branch_name,
               base_branch,
               cleanup_note,
@@ -260,6 +262,7 @@ export class AgentRunStore {
 
       let requested;
       let requestedBaseBranch: string | null | undefined;
+      let workspaceMode: RunWorkspaceMode | undefined;
       try {
         requested = row.requested_agent_provider
           ? this.resolvePersistedRequestedConfig(row)
@@ -267,6 +270,7 @@ export class AgentRunStore {
         requestedBaseBranch = row.requested_agent_provider ? row.requested_base_branch : row.base_branch;
         parseAgentProvider(requested.provider);
         parseAgentMode(requested.mode);
+        workspaceMode = parseRunWorkspaceMode(row.workspace_mode);
       } catch (error) {
         await this.markInvalidClaim(client, row, error);
         await client.query("COMMIT");
@@ -284,7 +288,7 @@ export class AgentRunStore {
           await client.query("COMMIT");
           return undefined;
         }
-      } else if (row.reuse_session) {
+      } else if (row.reuse_session && workspaceMode !== "cwd") {
         const reusableRepo = await client.query<{ repo_path: string }>(
           `SELECT prior.repo_path
            FROM ${this.table} AS prior
@@ -344,6 +348,8 @@ export class AgentRunStore {
         } else {
           reuseFallbackReason = "no available successful run with the same uid and a retained session worktree";
         }
+      } else if (row.reuse_session) {
+        reuseFallbackReason = "workspace_mode=cwd disables session reuse";
       }
 
       // The provider expression above is a non-locking preview. Re-check after
@@ -434,7 +440,7 @@ export class AgentRunStore {
           WHEN candidate.agent_provider IN ('codex', 'claude') THEN candidate.agent_provider
           ELSE ${requestedProvider}
         END
-      WHEN candidate.reuse_session THEN COALESCE(
+      WHEN candidate.reuse_session AND COALESCE(candidate.workspace_mode, '') <> 'cwd' THEN COALESCE(
         (
           SELECT CASE
                    WHEN prior.agent_provider IN ('codex', 'claude') THEN prior.agent_provider

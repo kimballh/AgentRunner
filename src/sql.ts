@@ -58,6 +58,7 @@ ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS result jsonb;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS exit_code integer;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS repo_path text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS worktree_path text;
+ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS workspace_mode text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS branch_name text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS base_branch text;
 ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS setup_logs text;

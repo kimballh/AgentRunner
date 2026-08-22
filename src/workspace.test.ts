@@ -24,6 +24,63 @@ describe("workspace", () => {
     expect(workspace.worktreePath).toBeUndefined();
   });
 
+  test("queued cwd mode skips worktree creation inside a configured repository", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const runner = recordingRunner();
+    const workspace = await prepareWorkspace({
+      config: serviceConfig({ cwd, git: { ...gitConfig(), repo } }),
+      run: row({ workspace_mode: "cwd" }),
+      completedRuns: [],
+      runner,
+    });
+
+    expect(workspace).toEqual({ cwd });
+    expect(runner.commands).toEqual([]);
+  });
+
+  test("queued worktree mode overrides a global never setting", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const runner = recordingRunner();
+    const workspace = await prepareWorkspace({
+      config: serviceConfig({
+        cwd,
+        git: { ...gitConfig(), createWorktrees: "never", repo, baseBranch: "origin/main" },
+      }),
+      run: row({ workspace_mode: "worktree" }),
+      completedRuns: [],
+      runner,
+    });
+
+    expect(workspace.worktreePath).toBeDefined();
+    expect(runner.commands.map((item) => item.command.join(" "))).toContain("git fetch origin");
+  });
+
+  test("rejects an invalid queued workspace mode", async () => {
+    await expect(
+      prepareWorkspace({
+        config: serviceConfig({ cwd: await tempDir() }),
+        run: row({ workspace_mode: "shared" }),
+        completedRuns: [],
+      }),
+    ).rejects.toThrow("Invalid workspace_mode: shared; expected cwd or worktree");
+  });
+
+  test("rejects retained session reuse for cwd mode", async () => {
+    await expect(
+      prepareReusedWorkspace({
+        config: serviceConfig({ cwd: await tempDir() }),
+        run: row({
+          workspace_mode: "cwd",
+          session_id: "session-1",
+          reused_from_run_id: 17,
+          worktree_path: "/tmp/worktree",
+        }),
+      }),
+    ).rejects.toThrow("session reuse requires a worktree workspace");
+  });
+
   test("configured repo creates a worktree from the configured base branch", async () => {
     const cwd = await tempDir();
     const repo = path.join(cwd, "repo");
@@ -387,8 +444,9 @@ describe("workspace", () => {
     });
 
     const workspace = await prepareReusedWorkspace({
-      config: serviceConfig({ cwd, git: { ...gitConfig(), repo } }),
+      config: serviceConfig({ cwd, git: { ...gitConfig(), createWorktrees: "never", repo } }),
       run: row({
+        workspace_mode: "worktree",
         session_id: "session-1",
         reused_from_run_id: 17,
         repo_path: repo,
