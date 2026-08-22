@@ -76,6 +76,16 @@ describe("renderRunsPage", () => {
     expect(failed).toContain(">Retry</button>");
     expect(succeeded).not.toContain(`onclick="retryRun(43, this)"`);
   });
+
+  test("shows an explicit per-run workspace mode", () => {
+    const html = renderRunsPage({
+      page: { runs: [listRow({ workspace_mode: "cwd" })], hasMore: false },
+      stats: { active: 0, queued: 1, maxWorkers: 1, availableWorkers: 1 },
+      config: config(),
+    });
+
+    expect(html).toContain("Workspace mode: cwd");
+  });
 });
 
 describe("dashboard cancellation endpoint", () => {
@@ -247,6 +257,7 @@ function listRow(overrides: Partial<ReturnType<typeof row>> & { created_at_curso
     updated_at: base.updated_at,
     repo_path: base.repo_path,
     worktree_path: base.worktree_path,
+    workspace_mode: base.workspace_mode,
     branch_name: base.branch_name,
     base_branch: base.base_branch,
     cleanup_note: base.cleanup_note,

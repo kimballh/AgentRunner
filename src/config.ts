@@ -2,7 +2,15 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { loadDotenv, optionalEnv } from "./env.js";
-import type { AgentMode, AgentProvider, AgentProviderMode, ServiceConfig, SetupMode, WorktreeMode } from "./types.js";
+import type {
+  AgentMode,
+  AgentProvider,
+  AgentProviderMode,
+  RunWorkspaceMode,
+  ServiceConfig,
+  SetupMode,
+  WorktreeMode,
+} from "./types.js";
 
 export interface ConfigOverrides {
   configPath?: string;
@@ -232,6 +240,16 @@ export function parseWorktreeMode(value: string): WorktreeMode {
     return "never";
   }
   throw new Error(`Invalid git.create_worktrees: ${value}`);
+}
+
+export function parseRunWorkspaceMode(value: string | null | undefined): RunWorkspaceMode | undefined {
+  if (value == null || value.trim() === "") {
+    return undefined;
+  }
+  if (value === "cwd" || value === "worktree") {
+    return value;
+  }
+  throw new Error(`Invalid workspace_mode: ${value}; expected cwd or worktree`);
 }
 
 export function parseSetupMode(value: string): SetupMode {

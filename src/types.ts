@@ -3,6 +3,7 @@ export type AgentProviderMode = AgentProvider | "both";
 export type AgentMode = "exec" | "app-server";
 export type RunStatus = "queued" | "retry" | "running" | "succeeded" | "failed" | "cancelled";
 export type WorktreeMode = "auto" | "always" | "never";
+export type RunWorkspaceMode = "cwd" | "worktree";
 export type SetupMode = "auto" | "always" | "never";
 
 export interface CodexConfig {
@@ -90,6 +91,7 @@ export interface AgentRunRow {
   exit_code?: number | null;
   repo_path?: string | null;
   worktree_path?: string | null;
+  workspace_mode?: string | null;
   branch_name?: string | null;
   base_branch?: string | null;
   setup_logs?: string | null;
@@ -127,6 +129,7 @@ export interface RunListItem {
   updated_at?: Date | null;
   repo_path?: string | null;
   worktree_path?: string | null;
+  workspace_mode?: string | null;
   branch_name?: string | null;
   base_branch?: string | null;
   cleanup_note?: string | null;

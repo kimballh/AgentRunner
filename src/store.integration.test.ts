@@ -232,6 +232,32 @@ maybeDescribe("AgentRunStore integration", () => {
     });
   });
 
+  test("cwd workspace mode bypasses retained session reuse", async () => {
+    await pool.query(
+      `INSERT INTO "${schema}"."agent_runs"
+       (status, raw_webhook_data, prompt, uid, created_at, finished_at, priority,
+        agent_provider, agent_mode, session_id, repo_path, worktree_path)
+       VALUES
+       ('succeeded', '{}'::jsonb, 'source', 'release-update', NOW() - INTERVAL '1 minute', NOW(), 0,
+        'claude', 'exec', 'release-session', '/tmp/repo', '/tmp/repo/.worktrees/release');
+       INSERT INTO "${schema}"."agent_runs"
+       (status, raw_webhook_data, prompt, uid, created_at, priority, reuse_session,
+        workspace_mode, agent_provider, model_name)
+       VALUES
+       ('queued', '{}'::jsonb, 'post update', 'release-update', NOW(), 95, true,
+        'cwd', 'codex', 'gpt-5.6-sol')`,
+    );
+
+    const claimed = await store.claimNext("cwd-worker", "codex");
+
+    expect(claimed?.row.workspace_mode).toBe("cwd");
+    expect(claimed?.row.session_id).toBeNull();
+    expect(claimed?.row.reused_from_run_id).toBeNull();
+    expect(claimed?.row.reuse_fallback_reason).toBe("workspace_mode=cwd disables session reuse");
+    expect(claimed?.resolved).toMatchObject({ provider: "codex", modelName: "gpt-5.6-sol" });
+    await store.markSucceeded(claimed!.row.id, "cwd-worker", { exitCode: 0, logs: "done" });
+  });
+
   test("does not lease one reusable session to two active runs", async () => {
     await pool.query(
       `INSERT INTO "${schema}"."agent_runs"

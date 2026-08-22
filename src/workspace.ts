@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
+import { parseRunWorkspaceMode } from "./config.js";
 import { runPreflightPhase } from "./preflight.js";
 import { runCommandOrThrow, runProcess, type ProcessResult } from "./process.js";
 import type { AgentRunRow, CompletedRunForCleanup, ServiceConfig, WorkspaceResult } from "./types.js";
@@ -31,8 +32,9 @@ export interface WorkspacePreparationInput {
 
 export async function prepareWorkspace(input: WorkspacePreparationInput): Promise<WorkspaceResult> {
   const runner = withAbortSignal(input.runner ?? defaultWorkspaceRunner, input.signal);
+  const workspaceMode = parseRunWorkspaceMode(input.run.workspace_mode);
   const repo = await workspacePhase(input.config, "resolve Git repository", () =>
-    resolveRepo(input.config, runner, input.signal),
+    resolveRepo(input.config, runner, input.signal, workspaceMode),
   );
   if (!repo.enabled) {
     return { cwd: input.config.cwd };
@@ -106,13 +108,17 @@ export async function prepareReusedWorkspace(input: {
   signal?: AbortSignal;
 }): Promise<WorkspaceResult> {
   const runner = withAbortSignal(input.runner ?? defaultWorkspaceRunner, input.signal);
+  const workspaceMode = parseRunWorkspaceMode(input.run.workspace_mode);
+  if (workspaceMode === "cwd") {
+    throw new Error("session reuse requires a worktree workspace");
+  }
   const worktreePath = input.run.worktree_path ? path.resolve(input.run.worktree_path) : undefined;
   if (!worktreePath || !input.run.session_id || !input.run.reused_from_run_id) {
     throw new Error("reusable run is missing its session or worktree metadata");
   }
 
   const repo = await workspacePhase(input.config, "resolve reusable Git repository", () =>
-    resolveRepo(input.config, runner, input.signal),
+    resolveRepo(input.config, runner, input.signal, workspaceMode),
   );
   if (!repo.enabled) {
     throw new Error("session reuse requires Git worktrees to be enabled");
@@ -265,8 +271,11 @@ async function resolveRepo(
   config: ServiceConfig,
   runner: WorkspaceCommandRunner,
   signal?: AbortSignal,
+  runWorkspaceMode?: "cwd" | "worktree",
 ): Promise<{ enabled: false } | { enabled: true; root: string }> {
-  if (config.git.createWorktrees === "never") {
+  const createWorktrees =
+    runWorkspaceMode === "worktree" ? "always" : runWorkspaceMode === "cwd" ? "never" : config.git.createWorktrees;
+  if (createWorktrees === "never") {
     return { enabled: false };
   }
   const configuredRepo = config.git.repo ? path.resolve(config.cwd, config.git.repo) : undefined;
@@ -276,7 +285,7 @@ async function resolveRepo(
 
   const result = await runProcess(["git", "rev-parse", "--show-toplevel"], { cwd: config.cwd, signal });
   if (result.exitCode !== 0) {
-    if (config.git.createWorktrees === "always") {
+    if (createWorktrees === "always") {
       throw new Error("git.create_worktrees is always but cwd is not inside a Git repository");
     }
     return { enabled: false };
@@ -284,7 +293,7 @@ async function resolveRepo(
 
   const root = result.stdout.trim();
   if (!root) {
-    if (config.git.createWorktrees === "always") {
+    if (createWorktrees === "always") {
       throw new Error("Unable to resolve Git repository root");
     }
     return { enabled: false };

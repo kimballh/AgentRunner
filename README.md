@@ -139,6 +139,14 @@ for locking, heartbeats, result JSON, exit codes, and workspace metadata.
 Workers claim jobs with `FOR UPDATE SKIP LOCKED` from rows whose status is
 `queued` or `retry`, ordered by `priority desc, created_at asc`.
 
+Set a queued row's `workspace_mode` to `cwd` to run that job directly in the
+AgentRunner process's startup directory without fetching, creating a branch, or
+creating a worktree. Set it to `worktree` to force a per-run worktree even when
+the global `[git].create_worktrees` setting is `never`. Leave it `NULL` to use
+the global setting. CWD mode also skips workspace setup and retained-session
+reuse. Multiple CWD jobs share the same directory, so reserve this mode for
+read-only or otherwise concurrency-safe tasks.
+
 Set a queued row's `reuse_session` column to `true` to request best-effort
 continuation of the newest successful run with the same `uid`. AgentRunner only
 reuses a retained provider session whose Git worktree still exists and is

@@ -11,6 +11,7 @@ describe("sql helpers", () => {
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS locked_by text");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS worktree_path text");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS workspace_mode text");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS worktree_removed_at timestamp");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS reuse_session boolean not null default false");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS session_id text");
