@@ -10,7 +10,7 @@ const program = new Command();
 
 program
   .name("agentrunner")
-  .description("Postgres-backed local agent job runner for Codex and Claude Code.")
+  .description("Postgres-backed local agent job runner for Codex, Claude Code, and Cursor.")
   .version("0.1.0");
 
 addConfigOptions(program.command("run").description("Start workers, poller, and dashboard."))
@@ -86,8 +86,8 @@ function addConfigOptions(command: Command): Command {
     .option("--database-url-env-var <name>", "Environment variable name containing the database URL")
     .option("--database-schema <name>", "Database schema name")
     .option("--database-table <name>", "Database table name")
-    .option("--agent-provider <provider>", "codex, claude, or both")
-    .option("--default-agent-provider <provider>", "codex or claude")
+    .option("--agent-provider <provider>", "codex, claude, cursor, both, or all")
+    .option("--default-agent-provider <provider>", "codex, claude, or cursor")
     .option("--agent-mode <mode>", "exec or app-server")
     .option("--num-workers <count>", "Number of concurrent workers per enabled provider")
     .option("--poll-frequency <ms>", "Poll frequency in milliseconds")

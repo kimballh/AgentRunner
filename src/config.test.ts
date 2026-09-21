@@ -69,6 +69,45 @@ describe("loadConfig", () => {
     expect(config.git.deleteDirtyWorktrees).toBe(false);
     expect(config.preflightRetries).toBe(2);
     expect(config.preflightRetryDelayMs).toBe(1_000);
+    expect(config.cursor).toMatchObject({
+      bin: "cursor-agent",
+      mode: "agent",
+      sandbox: "enabled",
+      force: false,
+    });
+  });
+
+  test("loads Cursor settings and all-provider mode", async () => {
+    const cwd = await tempDir();
+    await fs.writeFile(
+      path.join(cwd, "agentrunner_config.toml"),
+      [
+        'database_url_env_var = "CUSTOM_DB_URL"',
+        'agent_provider = "all"',
+        'default_agent_provider = "cursor"',
+        "[cursor]",
+        'bin = "/opt/cursor-agent"',
+        'default_model = "composer"',
+        'mode = "plan"',
+        'sandbox = "disabled"',
+        "force = true",
+        'extra_args = ["--trust"]',
+      ].join("\n"),
+    );
+    process.env.CUSTOM_DB_URL = "postgres://from-custom/db";
+
+    const config = await loadConfig({}, cwd);
+
+    expect(config.agentProvider).toBe("all");
+    expect(config.defaultAgentProvider).toBe("cursor");
+    expect(config.cursor).toEqual({
+      bin: "/opt/cursor-agent",
+      defaultModel: "composer",
+      mode: "plan",
+      sandbox: "disabled",
+      force: true,
+      extraArgs: ["--trust"],
+    });
   });
 
   test("loads git config and CLI overrides", async () => {
