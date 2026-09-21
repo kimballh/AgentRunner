@@ -67,6 +67,7 @@ function testConfig(claudeBin: string, cwd: string): ServiceConfig {
       maxWorktrees: 0,
       cleanupBatchSize: 1,
       cleanupDeleteBranches: false,
+      deleteDirtyWorktrees: false,
       setup: "never",
       setupCommand: [],
     },

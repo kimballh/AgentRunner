@@ -202,6 +202,57 @@ describe("workspace", () => {
     expect(runner.commands.map((item) => item.command.join(" "))).toContain(`git worktree remove ${old}`);
   });
 
+  test("cleanup preserves dirty completed worktrees by default", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const root = path.join(repo, ".worktrees");
+    const old = path.join(root, "old");
+    await fs.mkdir(old, { recursive: true });
+    const runner = recordingRunner({ dirtyStatus: " M src/changed.ts\n" });
+
+    const workspace = await prepareWorkspace({
+      config: serviceConfig({ cwd, git: { ...gitConfig(), repo, maxWorktrees: 1, cleanupBatchSize: 1 } }),
+      run: row(),
+      completedRuns: [cleanupRow(1, old)],
+      runner,
+    });
+
+    expect(workspace.cleanupNote).toContain("1 dirty skipped");
+    expect(runner.commands.map((item) => item.command.join(" "))).not.toContain(
+      `git worktree remove --force ${old}`,
+    );
+  });
+
+  test("cleanup force-deletes dirty completed worktrees when enabled", async () => {
+    const cwd = await tempDir();
+    const repo = path.join(cwd, "repo");
+    const root = path.join(repo, ".worktrees");
+    const old = path.join(root, "old");
+    await fs.mkdir(old, { recursive: true });
+    const runner = recordingRunner({ dirtyStatus: " M src/changed.ts\n" });
+
+    const workspace = await prepareWorkspace({
+      config: serviceConfig({
+        cwd,
+        git: {
+          ...gitConfig(),
+          repo,
+          maxWorktrees: 1,
+          cleanupBatchSize: 1,
+          deleteDirtyWorktrees: true,
+        },
+      }),
+      run: row(),
+      completedRuns: [cleanupRow(1, old)],
+      runner,
+    });
+
+    expect(workspace.cleanupNote).toContain("1 dirty force-deleted");
+    expect(runner.commands.map((item) => item.command.join(" "))).toContain(
+      `git worktree remove --force ${old}`,
+    );
+  });
+
   test("serialized cleanup reloads candidates after acquiring the lock", async () => {
     const cwd = await tempDir();
     const repo = path.join(cwd, "repo");
@@ -580,6 +631,7 @@ function gitConfig(): ServiceConfig["git"] {
     maxWorktrees: 25,
     cleanupBatchSize: 5,
     cleanupDeleteBranches: false,
+    deleteDirtyWorktrees: false,
     setup: "auto",
     setupCommand: [],
   };

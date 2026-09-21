@@ -123,6 +123,12 @@ agentrunner run \
   --max-worktrees 25
 ```
 
+By default, cleanup preserves completed worktrees with uncommitted changes. Pass
+`--delete-dirty-worktrees` to `agentrunner run` to enforce the retention limit
+by force-removing dirty completed or stale orphaned worktrees as well. This
+permanently discards their uncommitted tracked and untracked files; active or
+reusable runs remain ineligible for cleanup.
+
 When worktrees are enabled, AgentRunner fetches the configured remote, creates a
 per-run branch and worktree from the queued row's `base_branch` when present (or
 the configured/upstream base branch otherwise), runs setup, then executes Codex

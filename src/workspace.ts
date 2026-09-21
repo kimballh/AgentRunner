@@ -347,6 +347,7 @@ async function cleanupOldWorktrees(input: {
   let checked = 0;
   let removed = 0;
   let dirty = 0;
+  let deletedDirty = 0;
   for await (const run of input.completedRuns) {
     if (!run.worktree_path || !isPathInside(run.worktree_path, input.worktreeRoot)) {
       continue;
@@ -363,7 +364,14 @@ async function cleanupOldWorktrees(input: {
       continue;
     }
 
-    ({ checked, removed, dirty } = await removeCleanCandidates(input, existing, checked, removed, dirty));
+    ({ checked, removed, dirty, deletedDirty } = await removeCleanupCandidates(
+      input,
+      existing,
+      checked,
+      removed,
+      dirty,
+      deletedDirty,
+    ));
     if (removed >= input.config.git.cleanupBatchSize) {
       break;
     }
@@ -373,12 +381,22 @@ async function cleanupOldWorktrees(input: {
     return undefined;
   }
 
-  ({ checked, removed, dirty } = await removeCleanCandidates(input, existing, checked, removed, dirty));
+  ({ checked, removed, dirty, deletedDirty } = await removeCleanupCandidates(
+    input,
+    existing,
+    checked,
+    removed,
+    dirty,
+    deletedDirty,
+  ));
 
   if (removed === 0) {
     return dirty > 0
       ? `max_worktrees reached; no clean completed worktrees were available to remove (${dirty} dirty skipped)`
       : "max_worktrees reached; no completed worktrees were available to remove";
+  }
+  if (deletedDirty > 0) {
+    return `max_worktrees reached; removed ${removed} old worktree${removed === 1 ? "" : "s"} (${deletedDirty} dirty force-deleted)`;
   }
   return `max_worktrees reached; removed ${removed} old clean worktree${removed === 1 ? "" : "s"}`;
 }
@@ -389,7 +407,7 @@ interface CleanupCandidate {
   runId?: number;
 }
 
-async function removeCleanCandidates(
+async function removeCleanupCandidates(
   input: {
     config: ServiceConfig;
     repoRoot: string;
@@ -400,7 +418,8 @@ async function removeCleanCandidates(
   checked: number,
   removed: number,
   dirty: number,
-): Promise<{ checked: number; removed: number; dirty: number }> {
+  deletedDirty: number,
+): Promise<{ checked: number; removed: number; dirty: number; deletedDirty: number }> {
   while (checked < candidates.length && removed < input.config.git.cleanupBatchSize) {
     const candidate = candidates[checked++];
     let status: ProcessResult;
@@ -413,16 +432,22 @@ async function removeCleanCandidates(
       dirty++;
       continue;
     }
-    if (status.stdout.trim().length > 0) {
+    const candidateIsDirty = status.stdout.trim().length > 0;
+    if (candidateIsDirty && !input.config.git.deleteDirtyWorktrees) {
       dirty++;
       continue;
     }
     try {
       await workspacePhase(input.config, "remove old Git worktree", () =>
-        input.runner.run(["git", "worktree", "remove", candidate.path], {
-          cwd: input.repoRoot,
-          label: "remove old worktree",
-        }),
+        input.runner.run(
+          candidateIsDirty
+            ? ["git", "worktree", "remove", "--force", candidate.path]
+            : ["git", "worktree", "remove", candidate.path],
+          {
+            cwd: input.repoRoot,
+            label: "remove old worktree",
+          },
+        ),
       );
     } catch (error) {
       if (!(await pathExists(candidate.path))) {
@@ -431,6 +456,9 @@ async function removeCleanCandidates(
             candidate.runId,
             "worktree disappeared during concurrent cleanup reconciliation",
           );
+        }
+        if (candidateIsDirty) {
+          deletedDirty++;
         }
         removed++;
         continue;
@@ -452,10 +480,13 @@ async function removeCleanCandidates(
         }),
       );
     }
+    if (candidateIsDirty) {
+      deletedDirty++;
+    }
     removed++;
   }
 
-  return { checked, removed, dirty };
+  return { checked, removed, dirty, deletedDirty };
 }
 
 async function orphanedRegisteredWorktrees(input: {

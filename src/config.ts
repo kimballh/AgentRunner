@@ -33,6 +33,7 @@ export interface ConfigOverrides {
   baseBranch?: string;
   worktreeDir?: string;
   maxWorktrees?: string | number;
+  deleteDirtyWorktrees?: boolean;
   setupScript?: string;
   noSetup?: boolean;
 }
@@ -168,6 +169,7 @@ export async function loadConfig(
       ),
       cleanupDeleteBranches:
         envBoolean("AGENTRUNNER_CLEANUP_DELETE_BRANCHES") ?? booleanFrom(gitToml.cleanup_delete_branches) ?? false,
+      deleteDirtyWorktrees: overrides.deleteDirtyWorktrees ?? false,
       setup: overrides.noSetup
         ? "never"
         : parseSetupMode(optionalEnv("AGENTRUNNER_SETUP") ?? stringFrom(gitToml.setup) ?? "auto"),

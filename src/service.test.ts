@@ -46,6 +46,7 @@ function serviceConfig(agentProvider: AgentProviderMode, numWorkers: number): Se
       maxWorktrees: 25,
       cleanupBatchSize: 5,
       cleanupDeleteBranches: false,
+      deleteDirtyWorktrees: false,
       setup: "auto",
       setupCommand: [],
     },
