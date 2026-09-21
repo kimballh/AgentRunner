@@ -35,6 +35,7 @@ export interface GitConfig {
   maxWorktrees: number;
   cleanupBatchSize: number;
   cleanupDeleteBranches: boolean;
+  deleteDirtyWorktrees: boolean;
   setup: SetupMode;
   setupScript?: string;
   setupCommand: string[];

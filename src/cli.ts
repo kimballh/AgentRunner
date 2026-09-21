@@ -14,6 +14,10 @@ program
   .version("0.1.0");
 
 addConfigOptions(program.command("run").description("Start workers, poller, and dashboard."))
+  .option(
+    "--delete-dirty-worktrees",
+    "Force-delete dirty worktrees that are otherwise eligible for cleanup",
+  )
   .action(async (options) => {
     const config = await loadConfig(toOverrides(options), process.cwd());
     const service = new AgentRunnerService(config);
@@ -124,6 +128,7 @@ function toOverrides(options: Record<string, unknown>): ConfigOverrides {
     baseBranch: stringOption(options.baseBranch),
     worktreeDir: stringOption(options.worktreeDir),
     maxWorktrees: stringOption(options.maxWorktrees),
+    deleteDirtyWorktrees: options.deleteDirtyWorktrees === true ? true : undefined,
     setupScript: stringOption(options.setupScript),
     noSetup: options.setup === false,
   };

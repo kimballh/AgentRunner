@@ -416,6 +416,7 @@ function serviceConfig(url: string, databaseSchema: string): ServiceConfig {
       maxWorktrees: 25,
       cleanupBatchSize: 5,
       cleanupDeleteBranches: false,
+      deleteDirtyWorktrees: false,
       setup: "auto",
       setupCommand: [],
     },
