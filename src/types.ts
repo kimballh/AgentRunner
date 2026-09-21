@@ -1,5 +1,5 @@
-export type AgentProvider = "codex" | "claude";
-export type AgentProviderMode = AgentProvider | "both";
+export type AgentProvider = "codex" | "claude" | "cursor";
+export type AgentProviderMode = AgentProvider | "both" | "all";
 export type AgentMode = "exec" | "app-server";
 export type RunStatus = "queued" | "retry" | "running" | "succeeded" | "failed" | "cancelled";
 export type WorktreeMode = "auto" | "always" | "never";
@@ -22,6 +22,15 @@ export interface ClaudeConfig {
   defaultModel?: string;
   defaultReasoningEffort?: string;
   permissionMode?: string;
+  extraArgs: string[];
+}
+
+export interface CursorConfig {
+  bin: string;
+  defaultModel?: string;
+  mode: "agent" | "plan" | "ask";
+  sandbox: "enabled" | "disabled";
+  force: boolean;
   extraArgs: string[];
 }
 
@@ -61,6 +70,7 @@ export interface ServiceConfig {
   git: GitConfig;
   codex: CodexConfig;
   claude: ClaudeConfig;
+  cursor: CursorConfig;
 }
 
 export interface AgentRunRow {

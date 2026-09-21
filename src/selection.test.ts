@@ -22,6 +22,12 @@ describe("resolveRunConfig", () => {
     const resolved = resolveRunConfig(row({ agent_provider: null }), config);
     expect(resolved.provider).toBe("claude");
   });
+
+  test("all selects a Cursor row with Cursor defaults", () => {
+    const config = serviceConfig({ agentProvider: "all", defaultAgentProvider: "codex" });
+    const resolved = resolveRunConfig(row({ agent_provider: "cursor" }), config);
+    expect(resolved).toEqual({ provider: "cursor", mode: "exec", modelName: "cursor-default" });
+  });
 });
 
 function serviceConfig(overrides: Partial<ServiceConfig>): ServiceConfig {
@@ -67,6 +73,14 @@ function serviceConfig(overrides: Partial<ServiceConfig>): ServiceConfig {
       bin: "claude",
       defaultModel: "claude-default",
       defaultReasoningEffort: "medium",
+      extraArgs: [],
+    },
+    cursor: {
+      bin: "cursor-agent",
+      defaultModel: "cursor-default",
+      mode: "agent",
+      sandbox: "enabled",
+      force: false,
       extraArgs: [],
     },
     ...overrides,

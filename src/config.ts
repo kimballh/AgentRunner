@@ -56,6 +56,7 @@ export async function loadConfig(
   const toml = await readTomlConfig(configPath);
   const codexToml = section(toml.codex);
   const claudeToml = section(toml.claude);
+  const cursorToml = section(toml.cursor);
   const gitToml = section(toml.git);
 
   const databaseUrlEnvVar =
@@ -202,6 +203,16 @@ export async function loadConfig(
       permissionMode: optionalEnv("AGENTRUNNER_CLAUDE_PERMISSION_MODE") ?? stringFrom(claudeToml.permission_mode),
       extraArgs: [...stringArray(claudeToml.extra_args), ...envList("AGENTRUNNER_CLAUDE_EXTRA_ARGS")],
     },
+    cursor: {
+      bin: optionalEnv("AGENTRUNNER_CURSOR_BIN") ?? stringFrom(cursorToml.bin) ?? "cursor-agent",
+      defaultModel: optionalEnv("AGENTRUNNER_CURSOR_DEFAULT_MODEL") ?? stringFrom(cursorToml.default_model),
+      mode: parseCursorMode(optionalEnv("AGENTRUNNER_CURSOR_MODE") ?? stringFrom(cursorToml.mode) ?? "agent"),
+      sandbox: parseCursorSandbox(
+        optionalEnv("AGENTRUNNER_CURSOR_SANDBOX") ?? stringFrom(cursorToml.sandbox) ?? "enabled",
+      ),
+      force: envBoolean("AGENTRUNNER_CURSOR_FORCE") ?? booleanFrom(cursorToml.force) ?? false,
+      extraArgs: [...stringArray(cursorToml.extra_args), ...envList("AGENTRUNNER_CURSOR_EXTRA_ARGS")],
+    },
   };
 
   validateSqlIdentifier(config.databaseSchema, "database_schema");
@@ -211,17 +222,31 @@ export async function loadConfig(
 }
 
 export function parseAgentProviderMode(value: string): AgentProviderMode {
-  if (value === "codex" || value === "claude" || value === "both") {
+  if (value === "codex" || value === "claude" || value === "cursor" || value === "both" || value === "all") {
     return value;
   }
   throw new Error(`Invalid agent_provider: ${value}`);
 }
 
 export function parseAgentProvider(value: string): AgentProvider {
-  if (value === "codex" || value === "claude") {
+  if (value === "codex" || value === "claude" || value === "cursor") {
     return value;
   }
   throw new Error(`Invalid default_agent_provider: ${value}`);
+}
+
+export function parseCursorMode(value: string): "agent" | "plan" | "ask" {
+  if (value === "agent" || value === "plan" || value === "ask") {
+    return value;
+  }
+  throw new Error(`Invalid cursor.mode: ${value}`);
+}
+
+export function parseCursorSandbox(value: string): "enabled" | "disabled" {
+  if (value === "enabled" || value === "disabled") {
+    return value;
+  }
+  throw new Error(`Invalid cursor.sandbox: ${value}`);
 }
 
 export function parseAgentMode(value: string): AgentMode {

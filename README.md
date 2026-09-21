@@ -1,6 +1,6 @@
 # AgentRunner
 
-Postgres-backed local agent job runner for Codex and Claude Code.
+Postgres-backed local agent job runner for Codex, Claude Code, and Cursor CLI.
 
 ## Setup
 
@@ -83,15 +83,18 @@ loaded before config values are resolved.
 
 Key settings:
 
-- `agent_provider`: `codex`, `claude`, or `both`; default `both`.
-- `default_agent_provider`: used only when `agent_provider = "both"` and a row
-  has no `agent_provider`; default `codex`.
+- `agent_provider`: `codex`, `claude`, `cursor`, `both`, or `all`; default `both`.
+  `both` preserves the existing Codex + Claude worker set, while `all` also
+  starts Cursor workers.
+- `default_agent_provider`: used when `agent_provider = "both"` or `"all"` and
+  a row has no `agent_provider`; default `codex`.
 - `agent_mode`: `exec` or `app-server`; applies to Codex.
 - `database_url_env_var`: env var name to read the database URL from; default
   `AGENTRUNNER_DATABASE_URL`.
 - `num_workers`: concurrent workers per enabled provider. With
   `agent_provider = "both"`, setting this to `4` permits up to four Codex and four Claude runs
-  concurrently (eight total).
+  concurrently (eight total). With `agent_provider = "all"`, the same setting
+  also permits four Cursor runs (twelve total).
 - `poll_frequency_ms`, `database_schema`, `database_table`, `host`, and `port`.
 - `preflight_retries` defaults to `2` retries for transient Git, database, and
   system failures. `preflight_retry_delay_ms` defaults to `1000` and is used as
@@ -100,8 +103,12 @@ Key settings:
   creates isolated worktrees when AgentRunner starts inside a Git repo and keeps
   cwd execution outside Git repos.
 
-Provider defaults are configured under `[codex]` and `[claude]`, including
-default model and reasoning effort.
+Provider defaults are configured under `[codex]`, `[claude]`, and `[cursor]`.
+Cursor uses the supported non-interactive print mode. Its sandbox defaults to
+enabled and `force` defaults to false; enable `force` only together with an
+explicit Cursor permission policy suitable for the isolated worktree. For
+unattended authentication, supply `CURSOR_API_KEY` through the service secret
+environment rather than a repository file or command-line flag.
 
 CLI args use the same names with dashes, for example:
 

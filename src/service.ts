@@ -16,8 +16,8 @@ import { prepareReusedWorkspace, prepareWorkspace, runWorkspaceSetup, WorkspaceS
 export class AgentRunnerService {
   private readonly store: AgentRunStore;
   private readonly workerIdPrefix = `agentrunner-${process.pid}-${randomUUID().slice(0, 8)}`;
-  private readonly providerActive: Record<AgentProvider, number> = { codex: 0, claude: 0 };
-  private readonly providerWaiters: Record<AgentProvider, Array<() => void>> = { codex: [], claude: [] };
+  private readonly providerActive: Record<AgentProvider, number> = { codex: 0, claude: 0, cursor: 0 };
+  private readonly providerWaiters: Record<AgentProvider, Array<() => void>> = { codex: [], claude: [], cursor: [] };
   private active = 0;
   private queued = 0;
   private stopping = false;
@@ -76,7 +76,13 @@ export class AgentRunnerService {
   }
 
   private enabledProviders(): AgentProvider[] {
-    return this.config.agentProvider === "both" ? ["codex", "claude"] : [this.config.agentProvider];
+    if (this.config.agentProvider === "both") {
+      return ["codex", "claude"];
+    }
+    if (this.config.agentProvider === "all") {
+      return ["codex", "claude", "cursor"];
+    }
+    return [this.config.agentProvider];
   }
 
   private async refreshQueued(): Promise<void> {
@@ -87,7 +93,10 @@ export class AgentRunnerService {
     while (!this.stopping) {
       let claimed;
       try {
-        claimed = await this.store.claimNext(workerId, this.config.agentProvider === "both" ? provider : undefined);
+        claimed = await this.store.claimNext(
+          workerId,
+          this.config.agentProvider === "both" || this.config.agentProvider === "all" ? provider : undefined,
+        );
       } catch (error) {
         this.logWorkerError(workerId, "claiming next run", error);
         await this.sleep(this.config.pollFrequencyMs);

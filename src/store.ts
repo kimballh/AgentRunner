@@ -423,12 +423,14 @@ export class AgentRunStore {
 
   private claimProviderExpression(): string {
     const configuredProvider = `'${
-      this.config.agentProvider === "both" ? this.config.defaultAgentProvider : this.config.agentProvider
+      this.config.agentProvider === "both" || this.config.agentProvider === "all"
+        ? this.config.defaultAgentProvider
+        : this.config.agentProvider
     }'`;
     const requestedProvider =
-      this.config.agentProvider === "both"
+      this.config.agentProvider === "both" || this.config.agentProvider === "all"
         ? `CASE
-            WHEN COALESCE(candidate.requested_agent_provider, candidate.agent_provider) IN ('codex', 'claude')
+            WHEN COALESCE(candidate.requested_agent_provider, candidate.agent_provider) IN ('codex', 'claude', 'cursor')
               THEN COALESCE(candidate.requested_agent_provider, candidate.agent_provider)
             ELSE ${configuredProvider}
           END`
@@ -437,13 +439,13 @@ export class AgentRunStore {
     return `CASE
       WHEN candidate.session_id IS NOT NULL THEN
         CASE
-          WHEN candidate.agent_provider IN ('codex', 'claude') THEN candidate.agent_provider
+          WHEN candidate.agent_provider IN ('codex', 'claude', 'cursor') THEN candidate.agent_provider
           ELSE ${requestedProvider}
         END
       WHEN candidate.reuse_session AND COALESCE(candidate.workspace_mode, '') <> 'cwd' THEN COALESCE(
         (
           SELECT CASE
-                   WHEN prior.agent_provider IN ('codex', 'claude') THEN prior.agent_provider
+                   WHEN prior.agent_provider IN ('codex', 'claude', 'cursor') THEN prior.agent_provider
                  END
           FROM ${this.table} AS prior
           WHERE prior.uid = candidate.uid

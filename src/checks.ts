@@ -15,12 +15,17 @@ export async function runChecks(config: ServiceConfig): Promise<string[]> {
     await store.close();
   }
 
-  if (config.agentProvider === "codex" || config.agentProvider === "both") {
+  if (config.agentProvider === "codex" || config.agentProvider === "both" || config.agentProvider === "all") {
     messages.push(commandExists(config.codex.bin) ? `codex binary: ${config.codex.bin}` : `codex binary missing: ${config.codex.bin}`);
   }
-  if (config.agentProvider === "claude" || config.agentProvider === "both") {
+  if (config.agentProvider === "claude" || config.agentProvider === "both" || config.agentProvider === "all") {
     messages.push(
       commandExists(config.claude.bin) ? `claude binary: ${config.claude.bin}` : `claude binary missing: ${config.claude.bin}`,
+    );
+  }
+  if (config.agentProvider === "cursor" || config.agentProvider === "all") {
+    messages.push(
+      commandExists(config.cursor.bin) ? `cursor binary: ${config.cursor.bin}` : `cursor binary missing: ${config.cursor.bin}`,
     );
   }
   return messages;

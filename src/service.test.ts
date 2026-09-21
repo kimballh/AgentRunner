@@ -18,6 +18,14 @@ describe("AgentRunnerService worker capacity", () => {
 
     await service.stop();
   });
+
+  test("starts one worker pool per provider when all providers are enabled", async () => {
+    const service = new AgentRunnerService(serviceConfig("all", 4));
+
+    expect(service.stats()).toMatchObject({ active: 0, maxWorkers: 12, availableWorkers: 12 });
+
+    await service.stop();
+  });
 });
 
 function serviceConfig(agentProvider: AgentProviderMode, numWorkers: number): ServiceConfig {
@@ -52,5 +60,6 @@ function serviceConfig(agentProvider: AgentProviderMode, numWorkers: number): Se
     },
     codex: { bin: "codex", bypassApprovalsAndSandbox: true, extraArgs: [], appServerExtraArgs: [], config: [] },
     claude: { bin: "claude", extraArgs: [] },
+    cursor: { bin: "cursor-agent", mode: "agent", sandbox: "enabled", force: false, extraArgs: [] },
   };
 }

@@ -208,6 +208,7 @@ function config(): ServiceConfig {
     },
     codex: { bin: "codex", bypassApprovalsAndSandbox: true, extraArgs: [], appServerExtraArgs: [], config: [] },
     claude: { bin: "claude", extraArgs: [] },
+    cursor: { bin: "cursor-agent", mode: "agent", sandbox: "enabled", force: false, extraArgs: [] },
   };
 }
 

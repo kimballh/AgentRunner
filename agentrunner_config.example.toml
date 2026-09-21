@@ -8,7 +8,7 @@ database_table = "agent_runs"
 agent_provider = "both"
 default_agent_provider = "codex"
 agent_mode = "exec"
-# Concurrent workers per enabled provider (two total when agent_provider = "both").
+# Concurrent workers per enabled provider (two total for "both", three for "all").
 num_workers = 1
 poll_frequency_ms = 60000
 stale_after_ms = 900000
@@ -47,4 +47,14 @@ bin = "claude"
 default_model = ""
 default_reasoning_effort = ""
 permission_mode = ""
+extra_args = []
+
+[cursor]
+bin = "cursor-agent"
+default_model = ""
+# AgentRunner uses Cursor's non-interactive print mode. Safe defaults keep the
+# Cursor sandbox enabled and do not auto-approve tools or file changes.
+mode = "agent"
+sandbox = "enabled"
+force = false
 extra_args = []

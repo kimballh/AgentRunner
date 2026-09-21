@@ -139,5 +139,6 @@ function testConfig(codexBin: string, cwd: string): ServiceConfig {
       bin: "claude",
       extraArgs: [],
     },
+    cursor: { bin: "cursor-agent", mode: "agent", sandbox: "enabled", force: false, extraArgs: [] },
   };
 }
