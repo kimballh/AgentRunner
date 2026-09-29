@@ -50,8 +50,33 @@ async function runCodexExec(input: ExecutionInput): Promise<ExecutionResult> {
   const lastMessagePath = path.join(tempDir, "last-message.txt");
   try {
     const command = codexExecCommand(input, lastMessagePath);
-    const result = await runProcess(command, { cwd: input.cwd, stdin: input.prompt, signal: input.signal });
-    const threadId = parseExecThreadId(result.stdout) ?? input.sessionId;
+    let streamedThread: string | undefined;
+    const result = await runProcess(command, {
+      cwd: input.cwd,
+      stdin: input.prompt,
+      signal: input.signal,
+      maxCaptureBytes: input.config.outputMaxBytes,
+      onStdoutLine: (line) => {
+        input.observe?.({ source: "logs", kind: "stdout", text: line });
+        const event = parseJsonObject(line);
+        if (event)
+          input.observe?.({
+            source: "conversation",
+            kind: "provider",
+            data: event,
+          });
+        const session = parseExecThreadId(line);
+        if (session && session !== streamedThread)
+          input.observe?.({
+            source: "lifecycle",
+            kind: "session",
+            text: session,
+          });
+        streamedThread = session ?? streamedThread;
+      },
+      onStderrLine: (line) => input.observe?.({ source: "logs", kind: "stderr", text: line }),
+    });
+    const threadId = streamedThread ?? parseExecThreadId(result.stdout) ?? input.sessionId;
     const lastMessage = await fs.readFile(lastMessagePath, "utf8").catch(() => "");
     const logs = combinedLogs(result.stdout, result.stderr);
 
@@ -94,6 +119,7 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
   const closePromise = once(subprocess, "close").then(() => undefined);
 
   const stdoutLines: string[] = [];
+  let capturedBytes = 0;
   const conversation: unknown[] = [];
   let lastMessage = "";
   let threadId: string | undefined;
@@ -127,41 +153,58 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
       pending.clear();
     };
 
-    void readLines(subprocess.stdout, (line) => {
-      stdoutLines.push(line);
-      const message = parseJsonObject(line);
-      if (!message) {
-        return;
-      }
-      conversation.push(message);
-
-      const id = typeof message.id === "number" ? message.id : undefined;
-      if (id !== undefined) {
-        const waiter = pending.get(id);
-        if (waiter) {
-          pending.delete(id);
-          if (isRecord(message.error)) {
-            waiter.reject(new Error(stringValue(message.error.message) ?? "codex app-server request failed"));
-          } else {
-            waiter.resolve(isRecord(message.result) ? message.result : {});
-          }
+    void streamToString(
+      subprocess.stdout,
+      (line) => {
+        input.observe?.({ source: "logs", kind: "stdout", text: line });
+        const capture = capturedBytes + Buffer.byteLength(line) <= (input.config.outputMaxBytes ?? 32 * 1024 * 1024);
+        if (capture) {
+          stdoutLines.push(line);
+          capturedBytes += Buffer.byteLength(line);
         }
-        return;
-      }
+        const message = parseJsonObject(line);
+        if (!message) {
+          return;
+        }
+        input.observe?.({
+          source: "conversation",
+          kind: "provider",
+          data: message,
+        });
+        if (capture) conversation.push(message);
 
-      const method = stringValue(message.method);
-      const params = isRecord(message.params) ? message.params : {};
-      if (method === "item/agentMessage/delta") {
-        lastMessage += stringValue(params.delta) ?? "";
-      } else if (method === "turn/completed") {
-        completed = true;
-        const turn = isRecord(params.turn) ? params.turn : {};
-        const status = stringValue(turn.status);
-        status === "failed" ? reject(new Error("codex app-server turn failed")) : resolve();
-      } else if (method === "error") {
-        reject(new Error(stringValue(params.message) ?? "codex app-server error"));
-      }
-    })
+        const id = typeof message.id === "number" ? message.id : undefined;
+        if (id !== undefined) {
+          const waiter = pending.get(id);
+          if (waiter) {
+            pending.delete(id);
+            if (isRecord(message.error)) {
+              waiter.reject(new Error(stringValue(message.error.message) ?? "codex app-server request failed"));
+            } else {
+              waiter.resolve(isRecord(message.result) ? message.result : {});
+            }
+          }
+          return;
+        }
+
+        const method = stringValue(message.method);
+        const params = isRecord(message.params) ? message.params : {};
+        if (method === "item/agentMessage/delta") {
+          lastMessage = (lastMessage + (stringValue(params.delta) ?? "")).slice(
+            0,
+            input.config.outputMaxBytes ?? 32 * 1024 * 1024,
+          );
+        } else if (method === "turn/completed") {
+          completed = true;
+          const turn = isRecord(params.turn) ? params.turn : {};
+          const status = stringValue(turn.status);
+          status === "failed" ? reject(new Error("codex app-server turn failed")) : resolve();
+        } else if (method === "error") {
+          reject(new Error(stringValue(params.message) ?? "codex app-server error"));
+        }
+      },
+      input.config.outputMaxBytes,
+    )
       .then(() => {
         if (!completed) {
           const error = new Error("codex app-server exited before turn completed");
@@ -176,10 +219,18 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
       });
   });
 
-  const stderrPromise = streamToString(subprocess.stderr);
+  const stderrPromise = streamToString(
+    subprocess.stderr,
+    (line) => input.observe?.({ source: "logs", kind: "stderr", text: line }),
+    input.config.outputMaxBytes,
+  );
   try {
     await request("initialize", {
-      clientInfo: { name: "agentrunner", title: "AgentRunner", version: "0.1.0" },
+      clientInfo: {
+        name: "agentrunner",
+        title: "AgentRunner",
+        version: "0.1.0",
+      },
       capabilities: { experimentalApi: true },
     });
     send({ method: "initialized", params: {} });
@@ -210,6 +261,7 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
       throw new Error("codex app-server did not return a thread id");
     }
 
+    input.observe?.({ source: "lifecycle", kind: "session", text: threadId });
     await request("turn/start", {
       threadId,
       input: [{ type: "text", text: input.prompt, text_elements: [] }],
@@ -243,7 +295,8 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
         message: error instanceof Error ? error.message : String(error),
       },
       sessionId: threadId,
-      resumeUnavailable: Boolean(input.sessionId) && missingSessionMessage(error instanceof Error ? error.message : String(error)),
+      resumeUnavailable:
+        Boolean(input.sessionId) && missingSessionMessage(error instanceof Error ? error.message : String(error)),
     };
   } finally {
     detachAbort();

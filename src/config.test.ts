@@ -20,6 +20,43 @@ afterEach(() => {
 });
 
 describe("loadConfig", () => {
+  test("MCP has independent defaults and CLI/env/TOML precedence", async () => {
+    const cwd = await tempDir();
+    await fs.writeFile(
+      path.join(cwd, "agentrunner_config.toml"),
+      '[mcp]\nport=7777\npublic_url="https://toml.example/mcp"\n[mcp.oauth]\nissuer="https://auth.example/"\naudience="https://toml.example/mcp"\nallowed_subjects=["owner"]',
+    );
+    process.env.AGENTRUNNER_DATABASE_URL = "postgres://test/db";
+    process.env.AGENTRUNNER_PORT = "4567";
+    let config = await loadConfig({}, cwd);
+    expect(config.port).toBe(4567);
+    expect(config.mcp?.port).toBe(7777);
+    process.env.AGENTRUNNER_MCP_PORT = "8889";
+    config = await loadConfig({}, cwd);
+    expect(config.mcp?.port).toBe(8889);
+    config = await loadConfig({ mcpPort: "9999", mcpPublicUrl: "https://cli.example/mcp" }, cwd);
+    expect(config.port).toBe(4567);
+    expect(config.mcp?.port).toBe(9999);
+    expect(config.mcp?.publicUrl).toBe("https://cli.example/mcp");
+    expect(config.mcp?.oauth.allowedSubjects).toEqual(["owner"]);
+    await expect(loadConfig({ mcpPort: "invalid" }, cwd)).rejects.toThrow("mcp.port must be a number");
+  });
+
+  test("MCP auth environment overrides are separate from worker and dashboard defaults", async () => {
+    const cwd = await tempDir();
+    process.env.AGENTRUNNER_DATABASE_URL = "postgres://test/db";
+    process.env.AGENTRUNNER_MCP_OAUTH_ISSUER = "https://auth.example/";
+    process.env.AGENTRUNNER_MCP_OAUTH_AUDIENCE = "https://public.example/mcp";
+    process.env.AGENTRUNNER_MCP_OAUTH_ALLOWED_SUBJECTS = "owner,second third";
+    process.env.AGENTRUNNER_MCP_PUBLIC_URL = "https://public.example/mcp";
+    const config = await loadConfig({}, cwd);
+    expect(config.port).toBe(0);
+    expect(config.mcp?.port).toBe(8888);
+    expect(config.mcp?.oauth.allowedSubjects).toEqual(["owner", "second", "third"]);
+    expect(config.mcp?.oauth.audience).toBe(config.mcp?.publicUrl);
+    expect(config.outputMaxBytes).toBe(33554432);
+  });
+
   test("sources cwd .env and uses custom database URL env var", async () => {
     const cwd = await tempDir();
     await fs.writeFile(

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
+import { StringDecoder } from "node:string_decoder";
 import { createInterface } from "node:readline";
 import type { Readable } from "node:stream";
 import { redactSecrets } from "./redact.js";
@@ -30,7 +31,15 @@ export class CommandError extends Error {
 
 export async function runProcess(
   command: string[],
-  options: { cwd: string; stdin?: string; signal?: AbortSignal; terminationGraceMs?: number },
+  options: {
+    cwd: string;
+    stdin?: string;
+    signal?: AbortSignal;
+    terminationGraceMs?: number;
+    onStdoutLine?: (line: string) => void;
+    onStderrLine?: (line: string) => void;
+    maxCaptureBytes?: number;
+  },
 ): Promise<ProcessResult> {
   if (options.signal?.aborted) {
     return { stdout: "", stderr: "", exitCode: 1, aborted: true };
@@ -50,8 +59,8 @@ export async function runProcess(
 
   try {
     const [stdout, stderr, exitCode] = await Promise.all([
-      streamToString(subprocess.stdout),
-      streamToString(subprocess.stderr),
+      streamToString(subprocess.stdout, options.onStdoutLine, options.maxCaptureBytes),
+      streamToString(subprocess.stderr, options.onStderrLine, options.maxCaptureBytes),
       once(subprocess, "close").then(([code]) => (typeof code === "number" ? code : 1)),
     ]);
 
@@ -68,9 +77,15 @@ export async function runProcess(
 
 export async function runCommandOrThrow(
   command: string[],
-  options: { cwd: string; label: string; signal?: AbortSignal },
+  options: {
+    cwd: string;
+    label: string;
+    signal?: AbortSignal;
+    onStdoutLine?: (line: string) => void;
+    onStderrLine?: (line: string) => void;
+  },
 ): Promise<ProcessResult> {
-  const result = await runProcess(command, { cwd: options.cwd, signal: options.signal });
+  const result = await runProcess(command, options);
   if (result.exitCode !== 0) {
     throw new CommandError(
       `${options.label} failed with exit ${result.exitCode}: ${command.join(" ")}\n${result.stderr || result.stdout}`,
@@ -146,11 +161,43 @@ export function signalSubprocess(subprocess: ChildProcess, signal: NodeJS.Signal
   }
 }
 
-export async function streamToString(stream: Readable): Promise<string> {
+export async function streamToString(
+  stream: Readable,
+  onLine?: (line: string) => void,
+  maxBytes = 32 * 1024 * 1024,
+): Promise<string> {
   const chunks: Buffer[] = [];
+  let captured = 0;
+  const decoder = new StringDecoder("utf8");
+  let pending = "";
+  let skipped = false;
+  const consume = (text: string): void => {
+    if (!onLine) return;
+    for (const part of text.match(/[^\n]*\n|[^\n]+$/g) ?? []) {
+      const ended = part.endsWith("\n");
+      if (!skipped) pending += part;
+      if (Buffer.byteLength(pending) > Math.max(65536, maxBytes)) {
+        pending = "";
+        skipped = true;
+      }
+      if (ended) {
+        onLine(skipped ? "[oversized output line omitted]" : pending.replace(/\r?\n$/, ""));
+        pending = "";
+        skipped = false;
+      }
+    }
+  };
   for await (const chunk of stream) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    consume(decoder.write(buffer));
+    if (captured < maxBytes) {
+      const kept = buffer.subarray(0, maxBytes - captured);
+      chunks.push(kept);
+      captured += kept.length;
+    }
   }
+  consume(decoder.end());
+  if (onLine && (pending || skipped)) onLine(skipped ? "[oversized output line omitted]" : pending);
   return Buffer.concat(chunks).toString("utf8");
 }
 

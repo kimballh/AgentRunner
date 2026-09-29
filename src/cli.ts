@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { redactSecrets } from "./redact.js";
+import { startMcp } from "./mcp.js";
 import { Command } from "commander";
 import { runChecks } from "./checks.js";
 import { loadConfig, type ConfigOverrides } from "./config.js";
@@ -14,10 +16,7 @@ program
   .version("0.1.0");
 
 addConfigOptions(program.command("run").description("Start workers, poller, and dashboard."))
-  .option(
-    "--delete-dirty-worktrees",
-    "Force-delete dirty worktrees that are otherwise eligible for cleanup",
-  )
+  .option("--delete-dirty-worktrees", "Force-delete dirty worktrees that are otherwise eligible for cleanup")
   .action(async (options) => {
     const config = await loadConfig(toOverrides(options), process.cwd());
     const service = new AgentRunnerService(config);
@@ -31,51 +30,95 @@ addConfigOptions(program.command("run").description("Start workers, poller, and 
     process.on("SIGTERM", () => void shutdown());
   });
 
+program
+  .command("mcp")
+  .description("Serve the authenticated shared job queue over HTTP MCP (no workers).")
+  .option("--config <path>", "Path to agentrunner_config.toml")
+  .option("--database-url <url>", "Postgres connection URL")
+  .option("--database-url-env-var <name>", "Environment variable containing Postgres URL")
+  .option("--database-schema <name>", "Database schema")
+  .option("--database-table <name>", "Job queue table")
+  .option("--host <host>", "MCP host (default 127.0.0.1)")
+  .option("--port <port>", "MCP port (default 8888)")
+  .option("--public-url <url>", "Canonical HTTPS MCP URL ending in /mcp")
+  .action(async (options) => {
+    const overrides = toOverrides(options);
+    const config = await loadConfig({
+      ...overrides,
+      host: undefined,
+      port: undefined,
+      mcpHost: options.host,
+      mcpPort: options.port,
+      mcpPublicUrl: options.publicUrl,
+    });
+    const store = new AgentRunStore(config);
+    let mcp;
+    try {
+      mcp = await startMcp(config, store);
+    } catch (error) {
+      await store.close();
+      throw error;
+    }
+    console.log(`AgentRunner MCP: ${mcp.url} (public: ${config.mcp!.publicUrl})`);
+    let shuttingDown = false;
+    const shutdown = async (): Promise<void> => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      await mcp.close();
+      await store.close();
+    };
+    process.once("SIGINT", () => void shutdown());
+    process.once("SIGTERM", () => void shutdown());
+  });
+
 addConfigOptions(
   program
     .command("setup-db")
     .description("Create or migrate the configured Postgres schema/table.")
     .option("--force", "Drop and recreate the table if setup fails"),
-)
-  .action(async (options) => {
-    const config = await loadConfig(toOverrides(options), process.cwd());
-    const store = new AgentRunStore(config);
+).action(async (options) => {
+  const config = await loadConfig(toOverrides(options), process.cwd());
+  const store = new AgentRunStore(config);
+  try {
     try {
-      try {
-        await store.setup();
-      } catch (error) {
-        if (!options.force) {
-          throw error;
-        }
-        console.warn(
-          `Initial setup failed; dropping and recreating ${config.databaseSchema}.${config.databaseTable} because --force was set.`,
-        );
-        await store.dropTable();
-        await store.setup();
+      await store.setup();
+    } catch (error) {
+      if (!options.force) {
+        throw error;
       }
-      console.log(`Database ready: ${config.databaseSchema}.${config.databaseTable}`);
-    } finally {
-      await store.close();
+      console.warn(
+        `Initial setup failed; dropping and recreating ${config.databaseSchema}.${config.databaseTable} because --force was set.`,
+      );
+      await store.dropTable();
+      await store.setup();
     }
-  });
+    console.log(`Database ready: ${config.databaseSchema}.${config.databaseTable}`);
+  } finally {
+    await store.close();
+  }
+});
 
-addConfigOptions(program.command("print-ddl").description("Print setup SQL without applying it."))
-  .action(async (options) => {
-    const config = await loadConfig(toOverrides(options), process.cwd(), { requireDatabaseUrl: false });
+addConfigOptions(program.command("print-ddl").description("Print setup SQL without applying it.")).action(
+  async (options) => {
+    const config = await loadConfig(toOverrides(options), process.cwd(), {
+      requireDatabaseUrl: false,
+    });
     console.log(migrationSql(config));
-  });
+  },
+);
 
-addConfigOptions(program.command("check").description("Validate DB connectivity, table access, and agent binaries."))
-  .action(async (options) => {
-    const config = await loadConfig(toOverrides(options), process.cwd());
-    const messages = await runChecks(config);
-    for (const message of messages) {
-      console.log(message);
-    }
-  });
+addConfigOptions(
+  program.command("check").description("Validate DB connectivity, table access, and agent binaries."),
+).action(async (options) => {
+  const config = await loadConfig(toOverrides(options), process.cwd());
+  const messages = await runChecks(config);
+  for (const message of messages) {
+    console.log(message);
+  }
+});
 
 program.parseAsync(process.argv).catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : String(error));
+  console.error(redactSecrets(error instanceof Error ? error.message : String(error)));
   process.exit(1);
 });
 

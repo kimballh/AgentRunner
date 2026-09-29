@@ -61,6 +61,8 @@ export interface ServiceConfig {
   git: GitConfig;
   codex: CodexConfig;
   claude: ClaudeConfig;
+  mcp?: McpConfig;
+  outputMaxBytes?: number;
 }
 
 export interface AgentRunRow {
@@ -173,6 +175,7 @@ export interface ExecutionInput {
   config: ServiceConfig;
   sessionId?: string;
   signal?: AbortSignal;
+  observe?: ExecutionObserver;
 }
 
 export interface ExecutionResult {
@@ -185,6 +188,7 @@ export interface ExecutionResult {
   workspace?: WorkspaceResult;
   sessionId?: string;
   resumeUnavailable?: boolean;
+  outputComplete?: boolean;
 }
 
 export interface WorkspaceResult {
@@ -204,3 +208,20 @@ export interface WorkerStats {
   maxWorkers: number;
   availableWorkers: number;
 }
+
+export interface McpConfig {
+  host: string;
+  port: number;
+  publicUrl: string;
+  allowedOrigins: string[];
+  submissionsPerMinute: number;
+  maxPendingJobs: number;
+  oauth: { issuer: string; audience: string; allowedSubjects: string[] };
+}
+export interface ExecutionEvent {
+  source: "logs" | "setup" | "conversation" | "lifecycle";
+  kind: string;
+  text?: string;
+  data?: unknown;
+}
+export type ExecutionObserver = (event: ExecutionEvent) => void;

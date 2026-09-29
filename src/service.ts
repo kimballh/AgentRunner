@@ -1,3 +1,6 @@
+import { redactSecrets } from "./redact.js";
+import { AttemptRecorder } from "./recorder.js";
+import type { ExecutionObserver } from "./types.js";
 import { randomUUID } from "node:crypto";
 import { startDashboard, type DashboardServer } from "./dashboard.js";
 import { runAgent } from "./executors/index.js";
@@ -16,13 +19,22 @@ import { prepareReusedWorkspace, prepareWorkspace, runWorkspaceSetup, WorkspaceS
 export class AgentRunnerService {
   private readonly store: AgentRunStore;
   private readonly workerIdPrefix = `agentrunner-${process.pid}-${randomUUID().slice(0, 8)}`;
-  private readonly providerActive: Record<AgentProvider, number> = { codex: 0, claude: 0 };
-  private readonly providerWaiters: Record<AgentProvider, Array<() => void>> = { codex: [], claude: [] };
+  private readonly providerActive: Record<AgentProvider, number> = {
+    codex: 0,
+    claude: 0,
+  };
+  private readonly providerWaiters: Record<AgentProvider, Array<() => void>> = {
+    codex: [],
+    claude: [],
+  };
   private active = 0;
   private queued = 0;
   private stopping = false;
   private dashboard?: DashboardServer;
   private pollTimer?: NodeJS.Timeout;
+  private workers: Promise<void>[] = [];
+  private readonly sleepers = new Set<() => void>();
+  private stopPromise?: Promise<void>;
   private readonly activeRuns = new Map<number, { workerId: string; controller: AbortController }>();
 
   constructor(private readonly config: ServiceConfig) {
@@ -30,6 +42,7 @@ export class AgentRunnerService {
   }
 
   async start(): Promise<void> {
+    await this.store.queue.validate();
     await this.store.recoverStaleRuns();
     this.dashboard = await startDashboard({
       config: this.config,
@@ -43,24 +56,34 @@ export class AgentRunnerService {
     for (const provider of this.enabledProviders()) {
       for (let index = 0; index < this.config.numWorkers; index++) {
         const workerId = `${this.workerIdPrefix}-${provider}-${index + 1}`;
-        void this.workerLoop(workerId, provider).catch((error) => {
-          if (!this.stopping) {
-            console.error(`Worker ${workerId} stopped unexpectedly: ${errorMessage(error)}`);
-          }
-        });
+        this.workers.push(
+          this.workerLoop(workerId, provider).catch((error) => {
+            if (!this.stopping) {
+              console.error(`Worker ${workerId} stopped unexpectedly: ${errorMessage(error)}`);
+            }
+          }),
+        );
       }
     }
-    this.pollTimer = setInterval(() => {
-      void this.refreshQueued();
-    }, Math.min(this.config.pollFrequencyMs, 10_000));
+    this.pollTimer = setInterval(
+      () => {
+        void this.refreshQueued();
+      },
+      Math.min(this.config.pollFrequencyMs, 10_000),
+    );
     await this.refreshQueued();
   }
 
   async stop(): Promise<void> {
+    this.stopPromise ??= this.shutdown();
+    return this.stopPromise;
+  }
+  private async shutdown(): Promise<void> {
     this.stopping = true;
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-    }
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    for (const wake of this.sleepers) wake();
+    for (const active of this.activeRuns.values()) active.controller.abort(new Error("runner shutdown"));
+    await Promise.allSettled(this.workers);
     await this.dashboard?.close();
     await this.store.close();
   }
@@ -101,6 +124,16 @@ export class AgentRunnerService {
 
       const controller = new AbortController();
       this.activeRuns.set(claimed.row.id, { workerId, controller });
+      if (this.stopping) controller.abort(new Error("runner shutdown"));
+      const recorder = new AttemptRecorder(
+        this.store.queue,
+        claimed.row.id,
+        claimed.row.attempts!,
+        workerId,
+        (error) => controller.abort(error),
+        this.config.outputMaxBytes,
+      );
+      recorder.phase("workspace");
       void this.store
         .isCancellationRequested(claimed.row.id, workerId)
         .then((cancelRequested) => {
@@ -111,17 +144,28 @@ export class AgentRunnerService {
         .catch((error) => this.logWorkerError(workerId, `checking cancellation for run ${claimed.row.id}`, error));
       this.active++;
       await this.refreshQueued();
-      const heartbeat = setInterval(() => {
-        void this.store
-          .heartbeat(claimed.row.id, workerId)
-          .then((cancelRequested) => {
-            if (cancelRequested) {
-              controller.abort();
-            }
-          })
-          .catch((error) => this.logWorkerError(workerId, `heartbeating run ${claimed.row.id}`, error));
-      }, Math.min(30_000, Math.max(5_000, Math.floor(this.config.staleAfterMs / 3))));
+      const heartbeat = setInterval(
+        () => {
+          void this.store
+            .heartbeat(claimed.row.id, workerId)
+            .then((cancelRequested) => {
+              if (cancelRequested) {
+                controller.abort();
+              }
+            })
+            .catch((error) => this.logWorkerError(workerId, `heartbeating run ${claimed.row.id}`, error));
+        },
+        Math.min(30_000, Math.max(5_000, Math.floor(this.config.staleAfterMs / 3))),
+      );
 
+      const cancellationPoll = setInterval(() => {
+        void this.store
+          .isCancellationRequested(claimed.row.id, workerId)
+          .then((requested) => {
+            if (requested) controller.abort(new Error("cancelled by user"));
+          })
+          .catch((error) => this.logWorkerError(workerId, "polling cancellation", error));
+      }, 1000);
       let workspace: WorkspaceResult | undefined;
       try {
         const reuseRequested = Boolean(
@@ -133,6 +177,7 @@ export class AgentRunnerService {
               config: this.config,
               run: claimed.row,
               signal: controller.signal,
+              observe: recorder.observe,
             });
             await this.preflightPhase(workerId, claimed.row.id, "persist reused workspace metadata (database)", () =>
               this.store.recordWorkspace(claimed.row.id, workerId, workspace!),
@@ -141,6 +186,7 @@ export class AgentRunnerService {
             if (controller.signal.aborted) {
               throw error;
             }
+            recorder.observe({ source: "lifecycle", kind: "resume_fallback", text: errorMessage(error) });
             claimed.row = await this.preflightPhase(
               workerId,
               claimed.row.id,
@@ -158,20 +204,28 @@ export class AgentRunnerService {
           }
         }
 
-        workspace ??= await this.prepareFreshWorkspace(claimed, workerId, controller.signal);
+        workspace ??= await this.prepareFreshWorkspace(claimed, workerId, controller.signal, recorder.observe);
         const initialCwd = workspace.cwd;
 
+        recorder.phase("executing");
         let result = await this.withProviderSlot(claimed.resolved.provider, () =>
           runAgent({
             prompt: claimed.row.prompt,
             cwd: initialCwd,
             resolved: claimed.resolved,
             config: this.config,
-            sessionId: claimed.row.reused_from_run_id ? claimed.row.session_id ?? undefined : undefined,
+            sessionId: claimed.row.reused_from_run_id ? (claimed.row.session_id ?? undefined) : undefined,
             signal: controller.signal,
+            observe: recorder.observe,
           }),
         );
         if (!controller.signal.aborted && result.resumeUnavailable && claimed.row.reused_from_run_id) {
+          recorder.observe({
+            source: "lifecycle",
+            kind: "resume_fallback",
+            text: "provider could not resume retained session",
+          });
+          recorder.phase("workspace");
           claimed.row = await this.preflightPhase(
             workerId,
             claimed.row.id,
@@ -186,8 +240,9 @@ export class AgentRunnerService {
               ),
           );
           claimed.resolved = claimed.requested;
-          workspace = await this.prepareFreshWorkspace(claimed, workerId, controller.signal);
+          workspace = await this.prepareFreshWorkspace(claimed, workerId, controller.signal, recorder.observe);
           const fallbackCwd = workspace.cwd;
+          recorder.phase("executing");
           result = await this.withProviderSlot(claimed.resolved.provider, () =>
             runAgent({
               prompt: claimed.row.prompt,
@@ -195,6 +250,7 @@ export class AgentRunnerService {
               resolved: claimed.resolved,
               config: this.config,
               signal: controller.signal,
+              observe: recorder.observe,
             }),
           );
         }
@@ -205,9 +261,23 @@ export class AgentRunnerService {
         if (workspace.reuseLogs) {
           result.logs = `--- session reuse workspace refresh ---\n${workspace.reuseLogs}\n${result.logs}`;
         }
+        recorder.observe({
+          source: "lifecycle",
+          kind: "result",
+          data: {
+            exit_code: result.exitCode,
+            session_id: result.sessionId,
+            last_message: result.lastMessage?.slice(0, 1024),
+          },
+        });
+        recorder.phase("finalizing");
+        result.outputComplete = await recorder.finish();
+        if (recorder.error) throw recorder.error;
         await this.finalizeResult(claimed, workerId, result, controller.signal);
       } catch (error) {
-        const result = workspace ? failureResultForWorkspace(workspace) : undefined;
+        recorder.phase("finalizing");
+        const result = workspace ? failureResultForWorkspace(workspace) : { exitCode: 1, logs: "" };
+        result.outputComplete = await recorder.finish();
         await this.preflightPhase(workerId, claimed.row.id, "persist run failure (database)", () =>
           this.finalizeError(claimed, workerId, error, result, controller.signal),
         ).catch((markError) => {
@@ -215,6 +285,8 @@ export class AgentRunnerService {
         });
       } finally {
         clearInterval(heartbeat);
+        clearInterval(cancellationPoll);
+        await recorder.finish();
         if (this.activeRuns.get(claimed.row.id)?.controller === controller) {
           this.activeRuns.delete(claimed.row.id);
         }
@@ -228,6 +300,7 @@ export class AgentRunnerService {
     claimed: ClaimedRun,
     workerId: string,
     signal: AbortSignal,
+    observe: ExecutionObserver,
   ): Promise<WorkspaceResult> {
     const cleanupEnabled = this.config.git.maxWorktrees > 0;
     const workspace = await prepareWorkspace({
@@ -262,14 +335,16 @@ export class AgentRunnerService {
           this.store.markWorktreeRemoved(id, note),
         ),
       signal,
+      observe,
     });
     await this.preflightPhase(workerId, claimed.row.id, "persist workspace metadata (database)", () =>
       this.store.recordWorkspace(claimed.row.id, workerId, workspace),
     );
 
     try {
+      observe({ source: "lifecycle", kind: "phase", text: "setup" });
       const setupLogs = await this.preflightPhase(workerId, claimed.row.id, "workspace setup", () =>
-        runWorkspaceSetup(this.config, workspace, signal),
+        runWorkspaceSetup(this.config, workspace, signal, observe),
       );
       if (setupLogs) {
         workspace.setupLogs = setupLogs;
@@ -315,14 +390,24 @@ export class AgentRunnerService {
     result: ExecutionResult,
     signal: AbortSignal,
   ): Promise<void> {
-    if (await this.cancellationRequested(claimed.row.id, workerId, signal)) {
-      await this.store.markCancelled(claimed.row.id, workerId, result);
+    if (await this.cancellationRequested(claimed.row.id, workerId)) {
+      await this.store.markCancelled(claimed.row.id, workerId, result, claimed.row.attempts ?? 1);
       return;
     }
 
+    if (signal.aborted) {
+      await this.store.markFailed(
+        claimed.row.id,
+        workerId,
+        claimed.row,
+        signal.reason ?? new Error("execution interrupted"),
+        { ...result, exitCode: 1 },
+      );
+      return;
+    }
     const finalized =
       result.exitCode === 0
-        ? await this.store.markSucceeded(claimed.row.id, workerId, result)
+        ? await this.store.markSucceeded(claimed.row.id, workerId, result, claimed.row.attempts ?? 1)
         : await this.store.markFailed(
             claimed.row.id,
             workerId,
@@ -331,7 +416,7 @@ export class AgentRunnerService {
             result,
           );
     if (!finalized && (await this.store.isCancellationRequested(claimed.row.id, workerId))) {
-      await this.store.markCancelled(claimed.row.id, workerId, result);
+      await this.store.markCancelled(claimed.row.id, workerId, result, claimed.row.attempts ?? 1);
     }
   }
 
@@ -342,19 +427,19 @@ export class AgentRunnerService {
     result: ExecutionResult | undefined,
     signal: AbortSignal,
   ): Promise<void> {
-    if (await this.cancellationRequested(claimed.row.id, workerId, signal)) {
-      await this.store.markCancelled(claimed.row.id, workerId, result);
+    if (await this.cancellationRequested(claimed.row.id, workerId)) {
+      await this.store.markCancelled(claimed.row.id, workerId, result, claimed.row.attempts ?? 1);
       return;
     }
 
     const finalized = await this.store.markFailed(claimed.row.id, workerId, claimed.row, error, result);
     if (!finalized && (await this.store.isCancellationRequested(claimed.row.id, workerId))) {
-      await this.store.markCancelled(claimed.row.id, workerId, result);
+      await this.store.markCancelled(claimed.row.id, workerId, result, claimed.row.attempts ?? 1);
     }
   }
 
-  private async cancellationRequested(id: number, workerId: string, signal: AbortSignal): Promise<boolean> {
-    return signal.aborted || this.store.isCancellationRequested(id, workerId);
+  private async cancellationRequested(id: number, workerId: string): Promise<boolean> {
+    return this.store.isCancellationRequested(id, workerId);
   }
 
   private logWorkerError(workerId: string, action: string, error: unknown): void {
@@ -402,7 +487,16 @@ export class AgentRunnerService {
   }
 
   private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    if (this.stopping) return Promise.resolve();
+    return new Promise((resolve) => {
+      const wake = (): void => {
+        clearTimeout(timer);
+        this.sleepers.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, ms);
+      this.sleepers.add(wake);
+    });
   }
 }
 
@@ -415,7 +509,7 @@ function failureResultForWorkspace(workspace: WorkspaceResult): ExecutionResult 
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return redactSecrets(error instanceof Error ? error.message : String(error));
 }
 
 function findWorkspaceSetupError(error: unknown): WorkspaceSetupError | undefined {

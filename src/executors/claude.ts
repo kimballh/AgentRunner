@@ -3,15 +3,47 @@ import type { ExecutionInput, ExecutionResult } from "../types.js";
 
 export async function runClaude(input: ExecutionInput): Promise<ExecutionResult> {
   const command = claudeCommand(input);
-  const result = await runProcess(command, { cwd: input.cwd, stdin: input.prompt, signal: input.signal });
-  const parsed = parseClaudeOutput(result.stdout);
-  const sessionId = sessionIdFrom(parsed) ?? input.sessionId;
+  let finalEvent: unknown;
+  let streamedSession: string | undefined;
+  const result = await runProcess(command, {
+    cwd: input.cwd,
+    stdin: input.prompt,
+    signal: input.signal,
+    maxCaptureBytes: input.config.outputMaxBytes,
+    onStdoutLine: (line) => {
+      input.observe?.({ source: "logs", kind: "stdout", text: line });
+      const event = parseClaudeOutput(line);
+      if (event) {
+        input.observe?.({
+          source: "conversation",
+          kind: "provider",
+          data: event,
+        });
+        const session = sessionIdFrom(event);
+        if (session && session !== streamedSession)
+          input.observe?.({
+            source: "lifecycle",
+            kind: "session",
+            text: session,
+          });
+        streamedSession = session ?? streamedSession;
+        if ((event as Record<string, unknown>).type === "result") finalEvent = event;
+      }
+    },
+    onStderrLine: (line) => input.observe?.({ source: "logs", kind: "stderr", text: line }),
+  });
+  const parsed = finalEvent ?? parseClaudeOutput(result.stdout);
+  const sessionId = sessionIdFrom(parsed) ?? streamedSession ?? input.sessionId;
   const logs = [`--- stdout ---\n${result.stdout}`, `--- stderr ---\n${result.stderr}`].join("\n");
 
   return {
-    exitCode: result.exitCode,
+    exitCode:
+      parsed && typeof parsed === "object" && (parsed as Record<string, unknown>).is_error ? 1 : result.exitCode,
     lastMessage: lastMessageFrom(parsed) ?? result.stdout.trim(),
-    conversation: parsed ?? result.stdout,
+    conversation: result.stdout
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => parseClaudeOutput(line) ?? line),
     logs,
     result: {
       provider: "claude",
@@ -30,7 +62,14 @@ export async function runClaude(input: ExecutionInput): Promise<ExecutionResult>
 }
 
 function claudeCommand(input: ExecutionInput): string[] {
-  const command = [input.config.claude.bin, "-p", "--output-format", "json"];
+  const command = [
+    input.config.claude.bin,
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+  ];
   if (input.sessionId) {
     command.push("--resume", input.sessionId);
   }

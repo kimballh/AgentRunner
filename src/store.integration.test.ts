@@ -122,7 +122,7 @@ maybeDescribe("AgentRunStore integration", () => {
     expect(updated?.status).toBe("cancelled");
     expect(updated?.logs).toBe("partial");
     expect(updated?.error).toMatchObject({ message: "cancelled by user" });
-    expect(await store.requestCancellation(claimed!.row.id)).toEqual({ outcome: "not-running" });
+    expect(await store.requestCancellation(claimed!.row.id)).toEqual({ outcome: "requested", lockedBy: null });
   });
 
   test("manually retries a failed run exactly once", async () => {

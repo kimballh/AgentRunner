@@ -7,7 +7,10 @@ describe("sql helpers", () => {
   });
 
   test("prints operational columns", () => {
-    const sql = migrationSql({ databaseSchema: "public", databaseTable: "agent_runs" });
+    const sql = migrationSql({
+      databaseSchema: "public",
+      databaseTable: "agent_runs",
+    });
     expect(sql).toContain("CREATE TABLE IF NOT EXISTS");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS locked_by text");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS worktree_path text");
@@ -31,9 +34,9 @@ describe("sql helpers", () => {
     expect(sql).toContain("status IN ('succeeded', 'failed', 'cancelled')");
   });
 
-  test("prints force drop SQL for configured table only", () => {
+  test("prints force drop SQL for configured queue and companions only", () => {
     expect(dropTableSql({ databaseSchema: "custom", databaseTable: "runs" })).toBe(
-      'DROP TABLE IF EXISTS "custom"."runs" CASCADE;',
+      'DROP TABLE IF EXISTS "custom"."runs_events", "custom"."runs_attempts", "custom"."runs_mcp_requests", "custom"."runs" CASCADE;',
     );
   });
 });

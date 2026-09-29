@@ -1,4 +1,6 @@
 import { Pool, type PoolClient } from "pg";
+import { QueueApi } from "./queue-api.js";
+import { redactValue, redactSecrets } from "./redact.js";
 import { parseAgentMode, parseAgentProvider, parseRunWorkspaceMode } from "./config.js";
 import { qualifiedTable } from "./sql.js";
 import { resolveRunConfig } from "./selection.js";
@@ -40,14 +42,20 @@ export type RetryRequestOutcome = "queued" | "not-failed" | "not-found";
 export class AgentRunStore {
   private readonly pool: Pool;
   private readonly table: string;
+  readonly queue: QueueApi;
   private readonly localCleanupLocks = new Map<string, Promise<void>>();
 
   constructor(private readonly config: ServiceConfig) {
-    this.pool = new Pool({ connectionString: config.databaseUrl });
+    this.pool = new Pool({
+      connectionString: config.databaseUrl,
+      connectionTimeoutMillis: 5000,
+      query_timeout: 20000,
+    });
     this.pool.on("error", (error) => {
       console.warn(`Database connection error on idle client: ${errorMessage(error)}`);
     });
     this.table = qualifiedTable(config);
+    this.queue = new QueueApi(this.pool, config);
   }
 
   async close(): Promise<void> {
@@ -61,7 +69,16 @@ export class AgentRunStore {
 
   async setup(): Promise<void> {
     const { migrationSql } = await import("./sql.js");
-    await this.pool.query(migrationSql(this.config));
+    // Migrations can build indexes over an existing queue; they have no runtime query deadline.
+    const setupPool = new Pool({
+      connectionString: this.config.databaseUrl,
+      connectionTimeoutMillis: 5000,
+    });
+    try {
+      await setupPool.query(migrationSql(this.config));
+    } finally {
+      await setupPool.end();
+    }
   }
 
   async dropTable(): Promise<void> {
@@ -207,7 +224,7 @@ export class AgentRunStore {
 
   async recoverStaleRuns(): Promise<number> {
     const result = await this.pool.query(
-      `UPDATE ${this.table}
+      `WITH recovered AS (UPDATE ${this.table}
        SET status = CASE
              WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'
              WHEN COALESCE(attempts, 0) <= COALESCE(num_retries, 0) THEN 'retry'
@@ -224,14 +241,18 @@ export class AgentRunStore {
            error = COALESCE(error, CASE WHEN cancel_requested_at IS NOT NULL THEN $3::jsonb ELSE $2::jsonb END)
        WHERE status = 'running'
          AND heartbeat_at IS NOT NULL
-         AND heartbeat_at < NOW() - ($1::text)::interval`,
+         AND heartbeat_at < NOW() - ($1::text)::interval RETURNING *)
+        , closed_attempts AS (UPDATE ${this.queue.attempts} a SET status=CASE WHEN r.status='retry' THEN 'failed' ELSE r.status END,
+         phase='finished', finished_at=now(),error=r.error,output_complete=false
+       FROM recovered r WHERE a.run_id=r.id AND a.attempt_number=r.attempts AND a.status='running'
+       RETURNING a.run_id) SELECT count(*)::integer AS recovered_count FROM recovered`,
       [
         `${this.config.staleAfterMs} milliseconds`,
         stringifyPostgresJson({ message: "runner heartbeat expired" }),
         stringifyPostgresJson({ message: "cancelled by user" }),
       ],
     );
-    return result.rowCount ?? 0;
+    return result.rows[0]?.recovered_count ?? 0;
   }
 
   async claimNext(workerId: string, provider?: AgentProvider): Promise<ClaimedRun | undefined> {
@@ -410,6 +431,7 @@ export class AgentRunStore {
           requestedBaseBranch ?? null,
         ],
       );
+      await this.queue.beginAttempt(client, updated.rows[0]!, workerId);
       await client.query("COMMIT");
       return { row: updated.rows[0], resolved, requested, requestedBaseBranch };
     } catch (error) {
@@ -512,43 +534,15 @@ export class AgentRunStore {
   }
 
   async requestCancellation(id: number): Promise<CancellationRequestResult> {
-    const requested = await this.pool.query<{ locked_by: string | null }>(
-      `UPDATE ${this.table}
-       SET cancel_requested_at = COALESCE(cancel_requested_at, NOW()),
-           updated_at = NOW()
-       WHERE id = $1 AND status = 'running'
-       RETURNING locked_by`,
-      [id],
-    );
-    if (requested.rows[0]) {
-      return { outcome: "requested", lockedBy: requested.rows[0].locked_by };
-    }
-
-    const existing = await this.pool.query<{ status: string }>(`SELECT status FROM ${this.table} WHERE id = $1`, [id]);
-    return existing.rows[0] ? { outcome: "not-running" } : { outcome: "not-found" };
+    const row = await this.queue.cancel(this.pool, id);
+    if (row) return { outcome: "requested", lockedBy: row.locked_by ?? null };
+    const existing = await this.getRun(id);
+    return existing ? { outcome: "not-running" } : { outcome: "not-found" };
   }
 
   async retryFailedRun(id: number): Promise<RetryRequestOutcome> {
-    const retried = await this.pool.query(
-      `UPDATE ${this.table}
-       SET status = 'retry',
-           num_retries = GREATEST(COALESCE(num_retries, 0), COALESCE(attempts, 0)),
-           finished_at = NULL,
-           updated_at = NOW(),
-           locked_by = NULL,
-           locked_at = NULL,
-           heartbeat_at = NULL,
-           cancel_requested_at = NULL
-       WHERE id = $1 AND status = 'failed'
-       RETURNING id`,
-      [id],
-    );
-    if (retried.rows[0]) {
-      return "queued";
-    }
-
-    const existing = await this.pool.query<{ status: string }>(`SELECT status FROM ${this.table} WHERE id = $1`, [id]);
-    return existing.rows[0] ? "not-failed" : "not-found";
+    if (await this.queue.retry(this.pool, id)) return "queued";
+    return (await this.getRun(id)) ? "not-failed" : "not-found";
   }
 
   async isCancellationRequested(id: number, workerId: string): Promise<boolean> {
@@ -597,8 +591,8 @@ export class AgentRunStore {
     );
   }
 
-  async markSucceeded(id: number, workerId: string, result: ExecutionResult): Promise<boolean> {
-    const updated = await this.pool.query(
+  async markSucceeded(id: number, workerId: string, result: ExecutionResult, attemptNumber?: number): Promise<boolean> {
+    const updated = await this.finalizeQuery(
       `UPDATE ${this.table}
        SET status = 'succeeded',
            finished_at = NOW(),
@@ -616,29 +610,37 @@ export class AgentRunStore {
            locked_by = NULL,
            locked_at = NULL,
            heartbeat_at = NULL
-       WHERE id = $1 AND locked_by = $2 AND status = 'running' AND cancel_requested_at IS NULL`,
+       WHERE id = $1 AND locked_by = $2 AND status = 'running' AND cancel_requested_at IS NULL RETURNING *`,
       [
         id,
         workerId,
         nullablePostgresText(result.link),
         nullablePostgresText(result.lastMessage),
-        stringifyPostgresJson(result.conversation ?? null),
-        sanitizePostgresText(result.logs),
-        stringifyPostgresJson(result.result ?? null),
+        stringifyPostgresJson(redactValue(result.conversation ?? null)),
+        sanitizePostgresText(redactSecrets(result.logs)),
+        stringifyPostgresJson(redactValue(result.result ?? null)),
         result.exitCode,
         nullablePostgresText(result.sessionId),
         nullablePostgresText(result.workspace?.setupLogs),
         nullablePostgresText(result.workspace?.cleanupNote),
       ],
+      result,
+      attemptNumber,
     );
     return (updated.rowCount ?? 0) > 0;
   }
 
-  async markFailed(id: number, workerId: string, run: AgentRunRow, error: unknown, result?: ExecutionResult): Promise<boolean> {
+  async markFailed(
+    id: number,
+    workerId: string,
+    run: AgentRunRow,
+    error: unknown,
+    result?: ExecutionResult,
+  ): Promise<boolean> {
     const attempts = run.attempts ?? 1;
     const retries = run.num_retries ?? 0;
     const shouldRetry = attempts <= retries;
-    const updated = await this.pool.query(
+    const updated = await this.finalizeQuery(
       `UPDATE ${this.table}
        SET status = $3,
            finished_at = CASE WHEN $3 = 'failed' THEN NOW() ELSE finished_at END,
@@ -656,28 +658,35 @@ export class AgentRunStore {
            locked_by = NULL,
            locked_at = NULL,
            heartbeat_at = NULL
-       WHERE id = $1 AND locked_by = $2 AND status = 'running' AND cancel_requested_at IS NULL`,
+       WHERE id = $1 AND locked_by = $2 AND status = 'running' AND cancel_requested_at IS NULL RETURNING *`,
       [
         id,
         workerId,
         shouldRetry ? "retry" : "failed",
         nullablePostgresText(result?.link),
         nullablePostgresText(result?.lastMessage),
-        result?.conversation === undefined ? null : stringifyPostgresJson(result.conversation),
+        result?.conversation === undefined ? null : stringifyPostgresJson(redactValue(result.conversation)),
         nullablePostgresText(result?.logs),
-        result?.result === undefined ? null : stringifyPostgresJson(result.result),
+        result?.result === undefined ? null : stringifyPostgresJson(redactValue(result.result)),
         result?.exitCode ?? 1,
         nullablePostgresText(result?.sessionId),
         stringifyPostgresJson(errorToJson(error)),
         nullablePostgresText(result?.workspace?.setupLogs),
         nullablePostgresText(result?.workspace?.cleanupNote),
       ],
+      result,
+      run.attempts ?? 1,
     );
     return (updated.rowCount ?? 0) > 0;
   }
 
-  async markCancelled(id: number, workerId: string, result?: ExecutionResult): Promise<boolean> {
-    const updated = await this.pool.query(
+  async markCancelled(
+    id: number,
+    workerId: string,
+    result?: ExecutionResult,
+    attemptNumber?: number,
+  ): Promise<boolean> {
+    const updated = await this.finalizeQuery(
       `UPDATE ${this.table}
        SET status = 'cancelled',
            finished_at = NOW(),
@@ -696,23 +705,42 @@ export class AgentRunStore {
            locked_by = NULL,
            locked_at = NULL,
            heartbeat_at = NULL
-       WHERE id = $1 AND locked_by = $2 AND status = 'running'`,
+       WHERE id = $1 AND locked_by = $2 AND status = 'running' RETURNING *`,
       [
         id,
         workerId,
         nullablePostgresText(result?.link),
         nullablePostgresText(result?.lastMessage),
-        result?.conversation === undefined ? null : stringifyPostgresJson(result.conversation),
+        result?.conversation === undefined ? null : stringifyPostgresJson(redactValue(result.conversation)),
         nullablePostgresText(result?.logs),
-        result?.result === undefined ? null : stringifyPostgresJson(result.result),
+        result?.result === undefined ? null : stringifyPostgresJson(redactValue(result.result)),
         result?.exitCode ?? null,
         nullablePostgresText(result?.sessionId),
         stringifyPostgresJson({ message: "cancelled by user" }),
         nullablePostgresText(result?.workspace?.setupLogs),
         nullablePostgresText(result?.workspace?.cleanupNote),
       ],
+      result,
+      attemptNumber,
     );
     return (updated.rowCount ?? 0) > 0;
+  }
+
+  private async finalizeQuery(
+    sql: string,
+    params: unknown[],
+    result?: ExecutionResult,
+    attemptNumber?: number,
+  ): Promise<{ rowCount: number }> {
+    if (attemptNumber !== undefined) {
+      params.push(attemptNumber);
+      sql = sql.replace(" RETURNING *", ` AND attempts=$${params.length} RETURNING *`);
+    }
+    return this.queue.transaction(async (client) => {
+      const updated = await client.query<AgentRunRow>(sql, params);
+      if (updated.rows[0]) await this.queue.finishAttempt(client, updated.rows[0], result);
+      return { rowCount: updated.rowCount ?? 0 };
+    });
   }
 
   private async markInvalidClaim(client: PoolClient, row: AgentRunRow, error: unknown): Promise<void> {
@@ -781,7 +809,7 @@ function worktreeCleanupLockName(repoRoot: string): string {
 }
 
 export function errorToJson(error: unknown): Record<string, unknown> {
-  const serialized = serializeErrorValue(error, new Set());
+  const serialized = redactValue(serializeErrorValue(error, new Set()));
   if (serialized && typeof serialized === "object" && !Array.isArray(serialized)) {
     return serialized as Record<string, unknown>;
   }
@@ -811,11 +839,17 @@ export function stringifyPostgresJson(value: unknown): string {
 }
 
 function nullablePostgresText(value: string | null | undefined): string | null {
-  return value == null ? null : sanitizePostgresText(value);
+  return value == null ? null : sanitizePostgresText(redactSecrets(value));
 }
 
 function serializeErrorValue(value: unknown, seen: Set<object>): unknown {
-  if (value === null || value === undefined || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
     return value;
   }
   if (typeof value === "bigint" || typeof value === "symbol" || typeof value === "function") {
@@ -856,5 +890,5 @@ function serializeErrorValue(value: unknown, seen: Set<object>): unknown {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return redactSecrets(error instanceof Error ? error.message : String(error));
 }

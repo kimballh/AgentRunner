@@ -16,6 +16,8 @@ preflight_retries = 2
 preflight_retry_delay_ms = 1000
 host = "127.0.0.1"
 port = 0
+# Maximum captured output per attempt (workers), default 32 MiB.
+output_max_bytes = 33554432
 
 [git]
 # "auto" creates worktrees when started inside a Git repo, and uses cwd outside Git.
@@ -48,3 +50,17 @@ default_model = ""
 default_reasoning_effort = ""
 permission_mode = ""
 extra_args = []
+
+# Optional remote MCP queue controller. Requires Auth0; does not start workers.
+[mcp]
+host = "127.0.0.1"
+port = 8888
+public_url = "https://YOUR-STABLE-NGROK-DOMAIN/mcp"
+allowed_origins = []
+submissions_per_minute = 30
+max_pending_jobs = 1000
+
+[mcp.oauth]
+issuer = "https://YOUR-TENANT.auth0.com/"
+audience = "https://YOUR-STABLE-NGROK-DOMAIN/mcp"
+allowed_subjects = ["auth0|YOUR-USER-ID"]
