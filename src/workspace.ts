@@ -5,7 +5,13 @@ import { parse as parseToml } from "smol-toml";
 import { parseRunWorkspaceMode } from "./config.js";
 import { runPreflightPhase } from "./preflight.js";
 import { runCommandOrThrow, runProcess, type ProcessResult } from "./process.js";
-import type { AgentRunRow, CompletedRunForCleanup, ServiceConfig, WorkspaceResult } from "./types.js";
+import type {
+  AgentRunRow,
+  CompletedRunForCleanup,
+  ServiceConfig,
+  WorkspaceResult,
+  ExecutionObserver,
+} from "./types.js";
 
 export interface WorkspaceCommandRunner {
   run(command: string[], options: { cwd: string; label: string; signal?: AbortSignal }): Promise<ProcessResult>;
@@ -28,10 +34,11 @@ export interface WorkspacePreparationInput {
   onWorktreeRemoved?: (id: number, note: string) => Promise<void>;
   runner?: WorkspaceCommandRunner;
   signal?: AbortSignal;
+  observe?: ExecutionObserver;
 }
 
 export async function prepareWorkspace(input: WorkspacePreparationInput): Promise<WorkspaceResult> {
-  const runner = withAbortSignal(input.runner ?? defaultWorkspaceRunner, input.signal);
+  const runner = withAbortSignal(input.runner ?? observedRunner(input.observe), input.signal);
   const workspaceMode = parseRunWorkspaceMode(input.run.workspace_mode);
   const repo = await workspacePhase(input.config, "resolve Git repository", () =>
     resolveRepo(input.config, runner, input.signal, workspaceMode),
@@ -70,9 +77,7 @@ export async function prepareWorkspace(input: WorkspacePreparationInput): Promis
       0,
     );
   };
-  const cleanupNote = input.withCleanupLock
-    ? await input.withCleanupLock(repo.root, cleanUp)
-    : await cleanUp();
+  const cleanupNote = input.withCleanupLock ? await input.withCleanupLock(repo.root, cleanUp) : await cleanUp();
 
   await workspacePhase(input.config, "create worktree directory", () => fs.mkdir(worktreeRoot, { recursive: true }));
   await workspacePhase(input.config, "fetch Git base branch", () =>
@@ -106,8 +111,9 @@ export async function prepareReusedWorkspace(input: {
   run: AgentRunRow;
   runner?: WorkspaceCommandRunner;
   signal?: AbortSignal;
+  observe?: ExecutionObserver;
 }): Promise<WorkspaceResult> {
-  const runner = withAbortSignal(input.runner ?? defaultWorkspaceRunner, input.signal);
+  const runner = withAbortSignal(input.runner ?? observedRunner(input.observe), input.signal);
   const workspaceMode = parseRunWorkspaceMode(input.run.workspace_mode);
   if (workspaceMode === "cwd") {
     throw new Error("session reuse requires a worktree workspace");
@@ -226,13 +232,18 @@ export async function runWorkspaceSetup(
   config: ServiceConfig,
   workspace: WorkspaceResult,
   signal?: AbortSignal,
+  observe?: ExecutionObserver,
 ): Promise<string | undefined> {
   if (!workspace.worktreePath || config.git.setup === "never") {
     return undefined;
   }
 
   if (config.git.setupCommand.length > 0) {
-    const result = await runProcess(config.git.setupCommand, { cwd: workspace.worktreePath, signal });
+    const result = await runProcess(config.git.setupCommand, {
+      cwd: workspace.worktreePath,
+      signal,
+      ...observedOutput(observe),
+    });
     const logs = logsFor(result);
     if (result.exitCode !== 0) {
       throw new WorkspaceSetupError(`setup command failed with exit ${result.exitCode}`, logs);
@@ -250,6 +261,7 @@ export async function runWorkspaceSetup(
 
   const result = await runProcess(["bash", script.path], {
     cwd: workspace.worktreePath,
+    ...observedOutput(observe),
     stdin: script.inlineScript,
     signal,
   });
@@ -261,7 +273,10 @@ export async function runWorkspaceSetup(
 }
 
 export class WorkspaceSetupError extends Error {
-  constructor(message: string, readonly setupLogs: string) {
+  constructor(
+    message: string,
+    readonly setupLogs: string,
+  ) {
     super(message);
     this.name = "WorkspaceSetupError";
   }
@@ -283,7 +298,10 @@ async function resolveRepo(
     return { enabled: true, root: configuredRepo };
   }
 
-  const result = await runProcess(["git", "rev-parse", "--show-toplevel"], { cwd: config.cwd, signal });
+  const result = await runProcess(["git", "rev-parse", "--show-toplevel"], {
+    cwd: config.cwd,
+    signal,
+  });
   if (result.exitCode !== 0) {
     if (createWorktrees === "always") {
       throw new Error("git.create_worktrees is always but cwd is not inside a Git repository");
@@ -299,7 +317,10 @@ async function resolveRepo(
     return { enabled: false };
   }
 
-  await runner.run(["git", "rev-parse", "--git-dir"], { cwd: root, label: "verify git repository" });
+  await runner.run(["git", "rev-parse", "--git-dir"], {
+    cwd: root,
+    label: "verify git repository",
+  });
   return { enabled: true, root };
 }
 
@@ -356,7 +377,11 @@ async function cleanupOldWorktrees(input: {
       await input.onWorktreeRemoved?.(run.id, "worktree path was already absent during cleanup reconciliation");
       continue;
     }
-    existing.push({ path: run.worktree_path, branchName: run.branch_name ?? undefined, runId: run.id });
+    existing.push({
+      path: run.worktree_path,
+      branchName: run.branch_name ?? undefined,
+      runId: run.id,
+    });
     if (!cleanupRequired && existing.length >= input.config.git.maxWorktrees) {
       cleanupRequired = true;
     }
@@ -419,7 +444,12 @@ async function removeCleanupCandidates(
   removed: number,
   dirty: number,
   deletedDirty: number,
-): Promise<{ checked: number; removed: number; dirty: number; deletedDirty: number }> {
+): Promise<{
+  checked: number;
+  removed: number;
+  dirty: number;
+  deletedDirty: number;
+}> {
   while (checked < candidates.length && removed < input.config.git.cleanupBatchSize) {
     const candidate = candidates[checked++];
     let status: ProcessResult;
@@ -561,7 +591,9 @@ async function resolveSetupScript(
   workspace: WorkspaceResult,
 ): Promise<{ path: string; inlineScript?: string } | undefined> {
   if (config.git.setupScript) {
-    return { path: resolveConfiguredPath(config.git.setupScript, workspace.repoPath ?? workspace.worktreePath ?? config.cwd) };
+    return {
+      path: resolveConfiguredPath(config.git.setupScript, workspace.repoPath ?? workspace.worktreePath ?? config.cwd),
+    };
   }
 
   const environmentPath = path.join(workspace.worktreePath ?? config.cwd, ".codex", "environments", "environment.toml");
@@ -598,7 +630,10 @@ function slugify(input: string): string {
 }
 
 function shortId(): string {
-  return crypto.randomUUID().replace(/[^a-zA-Z0-9]/g, "").slice(0, 8);
+  return crypto
+    .randomUUID()
+    .replace(/[^a-zA-Z0-9]/g, "")
+    .slice(0, 8);
 }
 
 function isPathInside(candidate: string, parent: string): boolean {
@@ -660,4 +695,19 @@ function workspacePhase<T>(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function observedOutput(observe?: ExecutionObserver): {
+  onStdoutLine: (line: string) => void;
+  onStderrLine: (line: string) => void;
+} {
+  return {
+    onStdoutLine: (line) => observe?.({ source: "setup", kind: "stdout", text: line }),
+    onStderrLine: (line) => observe?.({ source: "setup", kind: "stderr", text: line }),
+  };
+}
+function observedRunner(observe?: ExecutionObserver): WorkspaceCommandRunner {
+  return {
+    run: (command, options) => runCommandOrThrow(command, { ...options, ...observedOutput(observe) }),
+  };
 }

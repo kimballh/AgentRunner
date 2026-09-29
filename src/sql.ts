@@ -103,9 +103,52 @@ CREATE INDEX IF NOT EXISTS agent_runs_pending_worktree_cleanup_idx
       AND status IN ('succeeded', 'failed', 'cancelled');
 
 CREATE INDEX IF NOT EXISTS agent_runs_locked_at_idx
-    ON ${table} (locked_at);`;
+    ON ${table} (locked_at);
+
+${historySql(config)}`;
 }
 
 export function dropTableSql(config: Pick<ServiceConfig, "databaseSchema" | "databaseTable">): string {
-  return `DROP TABLE IF EXISTS ${qualifiedTable(config)} CASCADE;`;
+  return `DROP TABLE IF EXISTS ${companionTable(config, "events")}, ${companionTable(config, "attempts")}, ${companionTable(config, "mcp_requests")}, ${qualifiedTable(config)} CASCADE;`;
+}
+
+export function companionTable(
+  config: Pick<ServiceConfig, "databaseSchema" | "databaseTable">,
+  suffix: string,
+): string {
+  const name = `${config.databaseTable}_${suffix}`;
+  if (Buffer.byteLength(name) > 63) throw new Error("database_table is too long for companion table names");
+  return `${quoteIdentifier(config.databaseSchema)}.${quoteIdentifier(name)}`;
+}
+
+function historySql(config: Pick<ServiceConfig, "databaseSchema" | "databaseTable">): string {
+  const attempts = companionTable(config, "attempts");
+  const events = companionTable(config, "events");
+  const receipts = companionTable(config, "mcp_requests");
+  return `CREATE TABLE IF NOT EXISTS ${attempts} (
+    run_id integer NOT NULL REFERENCES ${qualifiedTable(config)}(id) ON DELETE CASCADE,
+    attempt_number integer NOT NULL,
+    worker_id text NOT NULL, host text NOT NULL,
+    prompt text NOT NULL, configuration jsonb NOT NULL,
+    phase text NOT NULL DEFAULT 'workspace', status text NOT NULL DEFAULT 'running',
+    started_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz,
+    metadata jsonb NOT NULL DEFAULT '{}', result jsonb, error jsonb, exit_code integer,
+    last_message text, output_complete boolean NOT NULL DEFAULT false,
+    truncated boolean NOT NULL DEFAULT false,
+    PRIMARY KEY (run_id, attempt_number)
+  );
+  CREATE TABLE IF NOT EXISTS ${events} (
+    run_id integer NOT NULL, attempt_number integer NOT NULL, sequence bigint NOT NULL,
+    recorded_at timestamptz NOT NULL DEFAULT now(), source text NOT NULL, kind text NOT NULL,
+    text text, data jsonb,
+    PRIMARY KEY (run_id, attempt_number, sequence),
+    FOREIGN KEY (run_id, attempt_number) REFERENCES ${attempts}(run_id, attempt_number) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS ${receipts} (
+    issuer text NOT NULL, subject text NOT NULL, request_id text NOT NULL,
+    operation text NOT NULL, arguments_hash text NOT NULL,
+    run_id integer REFERENCES ${qualifiedTable(config)}(id) ON DELETE SET NULL,
+    response jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (issuer, subject, request_id)
+  );`;
 }

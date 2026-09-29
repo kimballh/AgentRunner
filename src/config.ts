@@ -36,6 +36,9 @@ export interface ConfigOverrides {
   deleteDirtyWorktrees?: boolean;
   setupScript?: string;
   noSetup?: boolean;
+  mcpHost?: string;
+  mcpPort?: string | number;
+  mcpPublicUrl?: string;
 }
 
 type TomlConfig = Record<string, unknown>;
@@ -57,6 +60,8 @@ export async function loadConfig(
   const codexToml = section(toml.codex);
   const claudeToml = section(toml.claude);
   const gitToml = section(toml.git);
+  const mcp = section(toml.mcp);
+  const oauth = section(mcp.oauth);
 
   const databaseUrlEnvVar =
     stringFrom(overrides.databaseUrlEnvVar) ??
@@ -70,6 +75,39 @@ export async function loadConfig(
 
   const config: ServiceConfig = {
     cwd,
+    outputMaxBytes: positiveInteger(
+      envNumber("AGENTRUNNER_OUTPUT_MAX_BYTES") ?? numberFrom(toml.output_max_bytes) ?? 32 * 1024 * 1024,
+      "output_max_bytes",
+    ),
+    mcp: {
+      host: overrides.mcpHost ?? optionalEnv("AGENTRUNNER_MCP_HOST") ?? stringFrom(mcp.host) ?? "127.0.0.1",
+      port: positiveInteger(
+        requiredNumber(overrides.mcpPort ?? optionalEnv("AGENTRUNNER_MCP_PORT") ?? mcp.port ?? 8888, "mcp.port"),
+        "mcp.port",
+      ),
+      publicUrl:
+        overrides.mcpPublicUrl ?? optionalEnv("AGENTRUNNER_MCP_PUBLIC_URL") ?? stringFrom(mcp.public_url) ?? "",
+      allowedOrigins:
+        optionalEnv("AGENTRUNNER_MCP_ALLOWED_ORIGINS")
+          ?.split(/[,\s]+/)
+          .filter(Boolean) ?? stringArray(mcp.allowed_origins),
+      submissionsPerMinute: positiveInteger(
+        envNumber("AGENTRUNNER_MCP_SUBMISSIONS_PER_MINUTE") ?? numberFrom(mcp.submissions_per_minute) ?? 30,
+        "mcp.submissions_per_minute",
+      ),
+      maxPendingJobs: positiveInteger(
+        envNumber("AGENTRUNNER_MCP_MAX_PENDING_JOBS") ?? numberFrom(mcp.max_pending_jobs) ?? 1000,
+        "mcp.max_pending_jobs",
+      ),
+      oauth: {
+        issuer: optionalEnv("AGENTRUNNER_MCP_OAUTH_ISSUER") ?? stringFrom(oauth.issuer) ?? "",
+        audience: optionalEnv("AGENTRUNNER_MCP_OAUTH_AUDIENCE") ?? stringFrom(oauth.audience) ?? "",
+        allowedSubjects:
+          optionalEnv("AGENTRUNNER_MCP_OAUTH_ALLOWED_SUBJECTS")
+            ?.split(/[,\s]+/)
+            .filter(Boolean) ?? stringArray(oauth.allowed_subjects),
+      },
+    },
     configPath,
     databaseUrl: databaseUrl ?? "",
     databaseUrlEnvVar,
@@ -96,10 +134,7 @@ export async function loadConfig(
         "codex",
     ),
     agentMode: parseAgentMode(
-      stringFrom(overrides.agentMode) ??
-        optionalEnv("AGENTRUNNER_AGENT_MODE") ??
-        stringFrom(toml.agent_mode) ??
-        "exec",
+      stringFrom(overrides.agentMode) ?? optionalEnv("AGENTRUNNER_AGENT_MODE") ?? stringFrom(toml.agent_mode) ?? "exec",
     ),
     numWorkers: positiveInteger(
       numberFrom(overrides.numWorkers) ?? envNumber("AGENTRUNNER_NUM_WORKERS") ?? numberFrom(toml.num_workers) ?? 1,
@@ -174,7 +209,9 @@ export async function loadConfig(
         ? "never"
         : parseSetupMode(optionalEnv("AGENTRUNNER_SETUP") ?? stringFrom(gitToml.setup) ?? "auto"),
       setupScript:
-        stringFrom(overrides.setupScript) ?? optionalEnv("AGENTRUNNER_SETUP_SCRIPT") ?? stringFrom(gitToml.setup_script),
+        stringFrom(overrides.setupScript) ??
+        optionalEnv("AGENTRUNNER_SETUP_SCRIPT") ??
+        stringFrom(gitToml.setup_script),
       setupCommand: [...stringArray(gitToml.setup_command), ...envList("AGENTRUNNER_SETUP_COMMAND")],
     },
     codex: {
@@ -344,7 +381,17 @@ function validateGitConfig(config: ServiceConfig): void {
   if (config.git.setupScript && config.git.setupCommand.length > 0) {
     throw new Error("git.setup_script and git.setup_command are mutually exclusive");
   }
-  if (config.git.branchPrefix.includes("..") || config.git.branchPrefix.startsWith("/") || config.git.branchPrefix.endsWith("/")) {
+  if (
+    config.git.branchPrefix.includes("..") ||
+    config.git.branchPrefix.startsWith("/") ||
+    config.git.branchPrefix.endsWith("/")
+  ) {
     throw new Error(`Invalid git.branch_prefix: ${config.git.branchPrefix}`);
   }
+}
+
+function requiredNumber(value: unknown, name: string): number {
+  const parsed = numberFrom(value);
+  if (parsed === undefined) throw new Error(`${name} must be a number`);
+  return parsed;
 }

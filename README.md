@@ -175,3 +175,16 @@ without rebuilding:
 ```bash
 npm run dev -- run
 ```
+
+## Remote MCP queue control
+
+Run `agentrunner mcp` to serve the existing queue over authenticated Streamable
+HTTP at `/mcp` on port **8888** (`--port` overrides it). Workers continue to run
+separately with `agentrunner run`. Tools submit/edit prompts, inspect queue and
+job details, cancel/retry jobs, and read live or historical output for each
+attempt. Auth0 OAuth restricts access to explicitly allowed user subjects.
+
+Apply the additive migrations with `agentrunner setup-db` and upgrade workers
+before enabling live capture. See [MCP setup and tool reference](docs/mcp.md) for
+Auth0, ngrok, ChatGPT/Claude/Grok Bot registration, configuration, and acceptance
+checks.
