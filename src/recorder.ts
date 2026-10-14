@@ -113,6 +113,9 @@ export class AttemptRecorder {
   get error(): Error | undefined {
     return this.failure;
   }
+  get sequenceNumber(): number {
+    return this.sequence;
+  }
   private fail(error: Error): void {
     if (!this.failure) {
       this.failure = error;

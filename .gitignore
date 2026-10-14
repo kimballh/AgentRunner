@@ -1,5 +1,6 @@
 # Logs
 logs
+.agentrunner-completions/
 *.log
 npm-debug.log*
 yarn-debug.log*

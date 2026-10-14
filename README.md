@@ -76,6 +76,13 @@ exit gracefully, force-kills it after a short timeout if necessary, and records
 the run as `cancelled` without consuming its configured retries. Existing logs,
 session metadata, and worktree metadata are retained.
 
+Successful executions save a durable completion receipt before persisting queue
+success. Database timeouts retry completion persistence without invoking the
+agent again. Unresolved completions pause new claims on that worker process;
+expired started attempts enter `completion_pending` rather than automatic retry.
+See [completion persistence and deployment](docs/completion-persistence.md) for
+receipt recovery, operational limits and coordinated upgrade requirements.
+
 ## Configuration
 
 Config precedence is CLI args, env vars, TOML, then defaults. `$cwd/.env` is

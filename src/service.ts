@@ -1,5 +1,7 @@
 import { redactSecrets } from "./redact.js";
 import { AttemptRecorder } from "./recorder.js";
+import { CompletionSpool, createCompletionReceipt, defaultSpoolDirectory, persistCompletion } from "./completion.js";
+import type { CompletionReceipt } from "./completion.js";
 import type { ExecutionObserver } from "./types.js";
 import { randomUUID } from "node:crypto";
 import { startDashboard, type DashboardServer } from "./dashboard.js";
@@ -18,6 +20,17 @@ import { prepareReusedWorkspace, prepareWorkspace, runWorkspaceSetup, WorkspaceS
 
 export class AgentRunnerService {
   private readonly store: AgentRunStore;
+  private readonly completionSpool: CompletionSpool;
+  private readonly pendingCompletions = new Map<string, {
+    runId: number;
+    attemptNumber: number;
+    workerId: string;
+    result?: ExecutionResult;
+    receipt?: CompletionReceipt;
+    ready: boolean;
+  }>();
+  private completionRetry?: Promise<void>;
+  private nextCompletionRetryAt = 0;
   private readonly workerIdPrefix = `agentrunner-${process.pid}-${randomUUID().slice(0, 8)}`;
   private readonly providerActive: Record<AgentProvider, number> = {
     codex: 0,
@@ -39,10 +52,12 @@ export class AgentRunnerService {
 
   constructor(private readonly config: ServiceConfig) {
     this.store = new AgentRunStore(config);
+    this.completionSpool = new CompletionSpool(defaultSpoolDirectory(config));
   }
 
   async start(): Promise<void> {
     await this.store.queue.validate();
+    await this.recoverCompletions();
     await this.store.recoverStaleRuns();
     this.dashboard = await startDashboard({
       config: this.config,
@@ -68,6 +83,9 @@ export class AgentRunnerService {
     this.pollTimer = setInterval(
       () => {
         void this.refreshQueued();
+        if (this.pendingCompletions.size && Date.now() >= this.nextCompletionRetryAt) {
+          void this.flushCompletions();
+        }
       },
       Math.min(this.config.pollFrequencyMs, 10_000),
     );
@@ -84,6 +102,7 @@ export class AgentRunnerService {
     for (const wake of this.sleepers) wake();
     for (const active of this.activeRuns.values()) active.controller.abort(new Error("runner shutdown"));
     await Promise.allSettled(this.workers);
+    await this.completionRetry;
     await this.dashboard?.close();
     await this.store.close();
   }
@@ -94,7 +113,7 @@ export class AgentRunnerService {
       active: this.active,
       queued: this.queued,
       maxWorkers,
-      availableWorkers: Math.max(0, maxWorkers - this.active),
+      availableWorkers: this.pendingCompletions.size ? 0 : Math.max(0, maxWorkers - this.active),
     };
   }
 
@@ -108,6 +127,12 @@ export class AgentRunnerService {
 
   private async workerLoop(workerId: string, provider: AgentProvider): Promise<void> {
     while (!this.stopping) {
+      // Bound retained output and database pressure while a completion cannot be
+      // acknowledged. Only the completion path may make progress for these runs.
+      if (this.pendingCompletions.size) {
+        await this.sleep(this.config.pollFrequencyMs);
+        continue;
+      }
       let claimed;
       try {
         claimed = await this.store.claimNext(workerId, this.config.agentProvider === "both" ? provider : undefined);
@@ -147,7 +172,7 @@ export class AgentRunnerService {
       const heartbeat = setInterval(
         () => {
           void this.store
-            .heartbeat(claimed.row.id, workerId)
+            .heartbeat(claimed.row.id, workerId, claimed.row.attempts ?? 1)
             .then((cancelRequested) => {
               if (cancelRequested) {
                 controller.abort();
@@ -167,6 +192,7 @@ export class AgentRunnerService {
           .catch((error) => this.logWorkerError(workerId, "polling cancellation", error));
       }, 1000);
       let workspace: WorkspaceResult | undefined;
+      let executionResult: ExecutionResult | undefined;
       try {
         const reuseRequested = Boolean(
           claimed.row.session_id && claimed.row.reused_from_run_id && claimed.row.worktree_path,
@@ -208,6 +234,7 @@ export class AgentRunnerService {
         const initialCwd = workspace.cwd;
 
         recorder.phase("executing");
+        await this.recordExecutionStarted(claimed, workerId);
         let result = await this.withProviderSlot(claimed.resolved.provider, () =>
           runAgent({
             prompt: claimed.row.prompt,
@@ -243,6 +270,7 @@ export class AgentRunnerService {
           workspace = await this.prepareFreshWorkspace(claimed, workerId, controller.signal, recorder.observe);
           const fallbackCwd = workspace.cwd;
           recorder.phase("executing");
+          await this.recordExecutionStarted(claimed, workerId);
           result = await this.withProviderSlot(claimed.resolved.provider, () =>
             runAgent({
               prompt: claimed.row.prompt,
@@ -254,6 +282,7 @@ export class AgentRunnerService {
             }),
           );
         }
+        executionResult = result;
         result.workspace = workspace;
         if (workspace.setupLogs) {
           result.logs = `${workspace.setupLogs}\n${result.logs}`;
@@ -271,10 +300,32 @@ export class AgentRunnerService {
           },
         });
         recorder.phase("finalizing");
+        if (result.exitCode === 0) {
+          // Save full output before waiting on any journal or another worker's
+          // completion transaction. The marker lets storage verify drain state.
+          result.outputComplete = false;
+          result.journalEndSequence = recorder.sequenceNumber;
+          await this.retainSuccessfulCompletion(claimed, workerId, result, false);
+          await recorder.finish();
+          if (recorder.error) this.logWorkerError(workerId, "flushing successful execution output", recorder.error);
+          const pending = this.pendingCompletions.get(`${claimed.row.id}:${claimed.row.attempts ?? 1}`);
+          if (pending) pending.ready = true;
+          await this.flushCompletions();
+          continue;
+        }
         result.outputComplete = await recorder.finish();
         if (recorder.error) throw recorder.error;
         await this.finalizeResult(claimed, workerId, result, controller.signal);
       } catch (error) {
+        if (executionResult?.exitCode === 0) {
+          // An executor outcome is not a database outcome. In particular, never
+          // replace a successful result with a setup-only failure or requeue it.
+          this.logWorkerError(workerId, "saving successful execution", error);
+          executionResult.outputComplete ??= await recorder.finish();
+          await this.retainSuccessfulCompletion(claimed, workerId, executionResult);
+          await this.flushCompletions();
+          continue;
+        }
         recorder.phase("finalizing");
         const result = workspace ? failureResultForWorkspace(workspace) : { exitCode: 1, logs: "" };
         result.outputComplete = await recorder.finish();
@@ -294,6 +345,73 @@ export class AgentRunnerService {
         await this.refreshQueued();
       }
     }
+  }
+
+  private async recordExecutionStarted(claimed: ClaimedRun, workerId: string): Promise<void> {
+    const started = await this.preflightPhase(workerId, claimed.row.id, "persist execution start (database)", () =>
+      this.store.markExecutionStarted(claimed.row.id, workerId, claimed.row.attempts ?? 1),
+    );
+    if (!started) throw new Error("Worker no longer owns the execution attempt");
+  }
+
+  private async retainSuccessfulCompletion(claimed: ClaimedRun, workerId: string, result: ExecutionResult, ready = true): Promise<void> {
+    const attemptNumber = claimed.row.attempts ?? 1;
+    const key = `${claimed.row.id}:${attemptNumber}`;
+    // Retain the original result even if local disk persistence itself fails.
+    let pending = this.pendingCompletions.get(key);
+    if (!pending) {
+      pending = { runId: claimed.row.id, attemptNumber, workerId, result, ready };
+      this.pendingCompletions.set(key, pending);
+    }
+    try {
+      pending.receipt ??= createCompletionReceipt(pending.runId, attemptNumber, workerId, result);
+      await this.completionSpool.put(pending.receipt);
+    } catch (error) {
+      this.logWorkerError(workerId, `spooling successful completion ${claimed.row.id}; result retained in memory`, error);
+    }
+  }
+
+  private async recoverCompletions(): Promise<void> {
+    for (const receipt of await this.completionSpool.list()) {
+      const key = `${receipt.runId}:${receipt.attemptNumber}`;
+      const existing = this.pendingCompletions.get(key);
+      if (existing && existing.receipt?.digest !== receipt.digest) {
+        throw new Error("Conflicting successful completion receipts prevent worker startup; evidence retained");
+      }
+      this.pendingCompletions.set(key, {
+        runId: receipt.runId, attemptNumber: receipt.attemptNumber, workerId: receipt.workerId, receipt, ready: true,
+      });
+    }
+    await this.flushCompletions();
+    if (this.pendingCompletions.size) {
+      throw new Error("Unresolved successful completions prevent worker startup; retained receipts require reconciliation");
+    }
+  }
+
+  private flushCompletions(): Promise<void> {
+    if (this.completionRetry) return this.completionRetry;
+    this.nextCompletionRetryAt = Date.now() + Math.max(1000, this.config.pollFrequencyMs);
+    this.completionRetry = (async () => {
+      for (const [key, pending] of this.pendingCompletions) {
+        if (!pending.ready) continue;
+        try {
+          pending.receipt ??= createCompletionReceipt(pending.runId, pending.attemptNumber, pending.workerId, pending.result!);
+          await this.completionSpool.put(pending.receipt);
+          const outcome = await persistCompletion(this.store, pending.receipt, {
+            maxAttempts: 3,
+            delayMs: 100,
+            onRetry: (error, attempt, maxAttempts) =>
+              this.logWorkerError(pending.workerId, `persisting completion ${pending.runId} (${attempt}/${maxAttempts})`, error),
+          });
+          if (outcome === "stale") throw new Error("Completion conflicts with the current attempt or receipt; evidence retained");
+          await this.completionSpool.remove(pending.receipt);
+          this.pendingCompletions.delete(key);
+        } catch (error) {
+          this.logWorkerError(pending.workerId, `retaining pending completion ${pending.runId}`, error);
+        }
+      }
+    })().finally(() => { this.completionRetry = undefined; });
+    return this.completionRetry;
   }
 
   private async prepareFreshWorkspace(
