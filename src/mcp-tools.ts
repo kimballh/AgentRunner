@@ -179,7 +179,7 @@ export function createToolServer(queue: QueueApi, principal: Principal): McpServ
     z.object({
       limit,
       cursor,
-      status: z.enum(["queued", "retry", "running", "succeeded", "failed", "cancelled"]).optional(),
+      status: z.enum(["queued", "retry", "running", "completion_pending", "succeeded", "failed", "cancelled"]).optional(),
       uid: text.optional(),
       provider: z.enum(["codex", "claude"]).optional(),
       updated_since: z.iso.datetime({ offset: true }).optional(),

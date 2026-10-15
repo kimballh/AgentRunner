@@ -1,5 +1,6 @@
 import { Pool, type PoolClient } from "pg";
-import { QueueApi } from "./queue-api.js";
+import { QueueApi, finishedAttemptColumns, type FinishedAttemptRow } from "./queue-api.js";
+import type { CompletionOutcome, CompletionReceipt } from "./completion.js";
 import { redactValue, redactSecrets } from "./redact.js";
 import { parseAgentMode, parseAgentProvider, parseRunWorkspaceMode } from "./config.js";
 import { qualifiedTable } from "./sql.js";
@@ -172,7 +173,7 @@ export class AgentRunStore {
              SELECT 1
              FROM ${this.table} AS active
              WHERE active.worktree_path = completed.worktree_path
-               AND active.status IN ('queued', 'retry', 'running')
+               AND active.status IN ('queued', 'retry', 'running', 'completion_pending')
            )
          ORDER BY worktree_path, COALESCE(finished_at, updated_at, created_at) DESC, id DESC
        ) AS latest_per_worktree
@@ -224,27 +225,36 @@ export class AgentRunStore {
 
   async recoverStaleRuns(): Promise<number> {
     const result = await this.pool.query(
-      `WITH recovered AS (UPDATE ${this.table}
+      `WITH stale AS (SELECT r.id,r.heartbeat_at AS observed_heartbeat,
+         EXISTS (SELECT 1 FROM ${this.queue.attempts} a WHERE a.run_id=r.id AND a.attempt_number=r.attempts
+           AND (a.metadata->>'execution_started'='true' OR a.phase IN ('executing','finalizing'))) OR
+         EXISTS (SELECT 1 FROM ${this.queue.events} e WHERE e.run_id=r.id AND e.attempt_number=r.attempts
+           AND e.source='lifecycle' AND e.kind='result') AS execution_started
+       FROM ${this.table} r WHERE r.status='running' AND r.heartbeat_at IS NOT NULL
+         AND r.heartbeat_at < NOW() - ($1::text)::interval),
+       recovered AS (UPDATE ${this.table} target
        SET status = CASE
-             WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'
-             WHEN COALESCE(attempts, 0) <= COALESCE(num_retries, 0) THEN 'retry'
+             WHEN stale.execution_started THEN 'completion_pending'
+             WHEN target.cancel_requested_at IS NOT NULL THEN 'cancelled'
+             WHEN COALESCE(target.attempts, 0) <= COALESCE(target.num_retries, 0) THEN 'retry'
              ELSE 'failed'
            END,
            finished_at = CASE
-             WHEN cancel_requested_at IS NULL AND COALESCE(attempts, 0) <= COALESCE(num_retries, 0) THEN finished_at
-             ELSE COALESCE(finished_at, NOW())
+             WHEN stale.execution_started OR (target.cancel_requested_at IS NULL AND COALESCE(target.attempts, 0) <= COALESCE(target.num_retries, 0)) THEN target.finished_at
+             ELSE COALESCE(target.finished_at, NOW())
            END,
            updated_at = NOW(),
-           locked_by = NULL,
-           locked_at = NULL,
-           heartbeat_at = NULL,
-           error = COALESCE(error, CASE WHEN cancel_requested_at IS NOT NULL THEN $3::jsonb ELSE $2::jsonb END)
-       WHERE status = 'running'
-         AND heartbeat_at IS NOT NULL
-         AND heartbeat_at < NOW() - ($1::text)::interval RETURNING *)
+           locked_by = CASE WHEN stale.execution_started THEN target.locked_by ELSE NULL END,
+           locked_at = CASE WHEN stale.execution_started THEN target.locked_at ELSE NULL END,
+           heartbeat_at = CASE WHEN stale.execution_started THEN target.heartbeat_at ELSE NULL END,
+           error = CASE WHEN stale.execution_started THEN target.error
+             ELSE COALESCE(target.error, CASE WHEN target.cancel_requested_at IS NOT NULL THEN $3::jsonb ELSE $2::jsonb END) END
+       FROM stale WHERE target.id=stale.id AND target.status='running'
+         AND target.heartbeat_at=stale.observed_heartbeat
+         AND target.heartbeat_at < NOW() - ($1::text)::interval RETURNING target.id,target.attempts,target.status,target.error)
         , closed_attempts AS (UPDATE ${this.queue.attempts} a SET status=CASE WHEN r.status='retry' THEN 'failed' ELSE r.status END,
          phase='finished', finished_at=now(),error=r.error,output_complete=false
-       FROM recovered r WHERE a.run_id=r.id AND a.attempt_number=r.attempts AND a.status='running'
+       FROM recovered r WHERE a.run_id=r.id AND a.attempt_number=r.attempts AND a.status='running' AND r.status<>'completion_pending'
        RETURNING a.run_id) SELECT count(*)::integer AS recovered_count FROM recovered`,
       [
         `${this.config.staleAfterMs} milliseconds`,
@@ -269,6 +279,12 @@ export class AgentRunStore {
       const selected = await client.query<AgentRunRow>(
         `SELECT candidate.* FROM ${this.table} AS candidate
          WHERE candidate.status IN ('queued', 'retry')
+           AND NOT EXISTS (SELECT 1 FROM ${this.table} active WHERE active.id<>candidate.id
+             AND active.session_id=candidate.session_id AND active.status='completion_pending')
+           AND NOT EXISTS (SELECT 1 FROM ${this.queue.attempts} a WHERE a.run_id=candidate.id AND a.attempt_number=candidate.attempts
+             AND (a.exit_code=0 OR a.metadata ? 'completion_digest'))
+           AND NOT EXISTS (SELECT 1 FROM ${this.queue.events} e WHERE e.run_id=candidate.id AND e.attempt_number=candidate.attempts
+             AND e.source='lifecycle' AND e.kind='result' AND e.data->>'exit_code'='0')
            AND ($1::text IS NULL OR ${this.claimProviderExpression()} = $1)
          ORDER BY candidate.priority DESC, candidate.created_at ASC
          FOR UPDATE SKIP LOCKED
@@ -323,7 +339,7 @@ export class AgentRunStore {
                SELECT 1
                FROM ${this.table} AS active
                WHERE active.session_id = prior.session_id
-                 AND active.status IN ('queued', 'retry', 'running')
+                 AND active.status IN ('queued', 'retry', 'running', 'completion_pending')
              )
            ORDER BY prior.finished_at DESC NULLS LAST, prior.id DESC
            LIMIT 1`,
@@ -349,7 +365,7 @@ export class AgentRunStore {
                    SELECT 1
                    FROM ${this.table} AS active
                    WHERE active.session_id = prior.session_id
-                     AND active.status IN ('queued', 'retry', 'running')
+                     AND active.status IN ('queued', 'retry', 'running', 'completion_pending')
                  )
                ORDER BY prior.finished_at DESC NULLS LAST, prior.id DESC
                FOR UPDATE OF prior SKIP LOCKED
@@ -478,7 +494,7 @@ export class AgentRunStore {
               SELECT 1
               FROM ${this.table} AS active
               WHERE active.session_id = prior.session_id
-                AND active.status IN ('queued', 'retry', 'running')
+                AND active.status IN ('queued', 'retry', 'running', 'completion_pending')
             )
           ORDER BY prior.finished_at DESC NULLS LAST, prior.id DESC
           LIMIT 1
@@ -549,21 +565,100 @@ export class AgentRunStore {
     const result = await this.pool.query<{ requested: boolean }>(
       `SELECT cancel_requested_at IS NOT NULL AS requested
        FROM ${this.table}
-       WHERE id = $1 AND locked_by = $2 AND status = 'running'`,
+       WHERE id = $1 AND locked_by = $2 AND status IN ('running','completion_pending')`,
       [id, workerId],
     );
     return result.rows[0]?.requested ?? false;
   }
 
-  async heartbeat(id: number, workerId: string): Promise<boolean> {
+  async heartbeat(id: number, workerId: string, attemptNumber?: number): Promise<boolean> {
     const result = await this.pool.query<{ cancel_requested: boolean }>(
       `UPDATE ${this.table}
        SET heartbeat_at = NOW(), updated_at = NOW()
-       WHERE id = $1 AND locked_by = $2 AND status = 'running'
+       WHERE id = $1 AND locked_by = $2 AND status IN ('running','completion_pending')
+         AND ($3::integer IS NULL OR attempts=$3)
        RETURNING cancel_requested_at IS NOT NULL AS cancel_requested`,
-      [id, workerId],
+      [id, workerId, attemptNumber ?? null],
     );
     return result.rows[0]?.cancel_requested ?? false;
+  }
+
+  /** Acknowledged before invoking a provider, so an expired lease cannot rerun uncertain external work. */
+  async markExecutionStarted(id: number, workerId: string, attemptNumber: number): Promise<boolean> {
+    return this.queue.transaction(async (client) => {
+      const owned = await client.query(
+        `UPDATE ${this.table} SET heartbeat_at=NOW(),updated_at=NOW()
+         WHERE id=$1 AND locked_by=$2 AND attempts=$3
+         AND status='running' AND cancel_requested_at IS NULL RETURNING id`,
+        [id, workerId, attemptNumber],
+      );
+      if (!owned.rows[0]) return false;
+      const updated = await client.query(
+        `UPDATE ${this.queue.attempts} SET metadata=metadata || '{"execution_started":true}'::jsonb,phase='executing'
+         WHERE run_id=$1 AND worker_id=$2 AND attempt_number=$3 AND status='running' RETURNING run_id`,
+        [id, workerId, attemptNumber],
+      );
+      return (updated.rowCount ?? 0) === 1;
+    });
+  }
+
+  /** An uncertain COMMIT is only accepted when this exact receipt closed this exact attempt. */
+  async readCompletion(receipt: CompletionReceipt): Promise<CompletionOutcome> {
+    const response = await this.pool.query<{
+      status: string; attempts: number; locked_by: string | null;
+      worker_id: string; attempt_status: string; completion_digest: string | null;
+    }>(
+      `SELECT r.status,r.attempts,r.locked_by,a.worker_id,a.status AS attempt_status,
+         a.metadata->>'completion_digest' AS completion_digest
+       FROM ${this.table} r JOIN ${this.queue.attempts} a ON a.run_id=r.id AND a.attempt_number=$2
+       WHERE r.id=$1`,
+      [receipt.runId, receipt.attemptNumber],
+    );
+    const row = response.rows[0];
+    if (!row || row.attempts !== receipt.attemptNumber || row.worker_id !== receipt.workerId) return "stale";
+    if (row.completion_digest === receipt.digest && row.status === row.attempt_status
+      && (row.status === "succeeded" || row.status === "cancelled")) return row.status;
+    return ["running", "completion_pending"].includes(row.status) && row.locked_by === receipt.workerId
+      && row.attempt_status === "running" ? "pending" : "stale";
+  }
+
+  /** Persistence replay only: never claims a job or invokes an executor. */
+  async completeSuccess(receipt: CompletionReceipt): Promise<CompletionOutcome> {
+    if (receipt.result.exitCode !== 0) throw new Error("Success completion requires exitCode=0");
+    const result = receipt.result;
+    const outcome = await this.queue.transaction(async (client): Promise<CompletionOutcome | undefined> => {
+      const updated = await client.query<FinishedAttemptRow>(
+        `UPDATE ${this.table}
+         SET status=CASE WHEN cancel_requested_at IS NULL THEN 'succeeded' ELSE 'cancelled' END,
+             finished_at=NOW(),updated_at=NOW(),link=$4,last_message=$5,conversation=$6::jsonb,
+             logs=$7,result=$8::jsonb,exit_code=$9,session_id=COALESCE($10,session_id),
+             setup_logs=COALESCE($11,setup_logs),cleanup_note=COALESCE($12,cleanup_note),
+             error=CASE WHEN cancel_requested_at IS NULL THEN NULL ELSE $13::jsonb END,
+             locked_by=NULL,locked_at=NULL,heartbeat_at=NULL
+         WHERE id=$1 AND locked_by=$2 AND attempts=$3 AND status IN ('running','completion_pending')
+         RETURNING ${finishedAttemptColumns}`,
+        [receipt.runId, receipt.workerId, receipt.attemptNumber,
+          nullablePostgresText(result.link), nullablePostgresText(result.lastMessage),
+          stringifyPostgresJson(redactValue(result.conversation ?? null)), sanitizePostgresText(redactSecrets(result.logs)),
+          stringifyPostgresJson(redactValue(result.result ?? null)), result.exitCode, nullablePostgresText(result.sessionId),
+          nullablePostgresText(result.workspace?.setupLogs), nullablePostgresText(result.workspace?.cleanupNote),
+          stringifyPostgresJson({ message: "cancelled by user" })],
+      );
+      const row = updated.rows[0];
+      if (!row) return undefined;
+      let finishedResult = result;
+      if (result.journalEndSequence !== undefined) {
+        const journal = await client.query<{ output_complete: boolean }>(
+          `SELECT EXISTS (SELECT 1 FROM ${this.queue.events} WHERE run_id=$1 AND attempt_number=$2 AND sequence=$3
+             AND source='lifecycle' AND kind='phase' AND text='finalizing') AS output_complete`,
+          [receipt.runId, receipt.attemptNumber, result.journalEndSequence],
+        );
+        finishedResult = { ...result, outputComplete: journal.rows[0]?.output_complete ?? false };
+      }
+      await this.queue.finishAttempt(client, row, finishedResult, { workerId: receipt.workerId, digest: receipt.digest });
+      return row.status === "cancelled" ? "cancelled" : "succeeded";
+    });
+    return outcome ?? this.readCompletion(receipt);
   }
 
   async recordWorkspace(id: number, workerId: string, workspace: WorkspaceResult): Promise<void> {
@@ -734,10 +829,12 @@ export class AgentRunStore {
   ): Promise<{ rowCount: number }> {
     if (attemptNumber !== undefined) {
       params.push(attemptNumber);
-      sql = sql.replace(" RETURNING *", ` AND attempts=$${params.length} RETURNING *`);
+      sql = sql.replace(" RETURNING *", ` AND attempts=$${params.length} RETURNING ${finishedAttemptColumns}`);
+    } else {
+      sql = sql.replace(" RETURNING *", ` RETURNING ${finishedAttemptColumns}`);
     }
     return this.queue.transaction(async (client) => {
-      const updated = await client.query<AgentRunRow>(sql, params);
+      const updated = await client.query<FinishedAttemptRow>(sql, params);
       if (updated.rows[0]) await this.queue.finishAttempt(client, updated.rows[0], result);
       return { rowCount: updated.rowCount ?? 0 };
     });

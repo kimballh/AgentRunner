@@ -43,6 +43,21 @@ export interface OutputInput {
   limit?: number;
 }
 
+/** Fields needed to close history; exclude potentially large output snapshots. */
+export type FinishedAttemptRow = Pick<
+  AgentRunRow,
+  | "id" | "attempts" | "status" | "error" | "exit_code"
+  | "agent_provider" | "agent_mode" | "model_name" | "reasoning_effort" | "base_branch"
+  | "session_id" | "repo_path" | "worktree_path" | "branch_name"
+  | "reused_from_run_id" | "reuse_fallback_reason"
+>;
+
+export const finishedAttemptColumns = [
+  "id", "attempts", "status", "error", "exit_code", "agent_provider", "agent_mode", "model_name",
+  "reasoning_effort", "base_branch", "session_id", "repo_path", "worktree_path", "branch_name",
+  "reused_from_run_id", "reuse_fallback_reason",
+].join(", ");
+
 export class QueueApi {
   readonly attempts: string;
   readonly events: string;
@@ -117,18 +132,19 @@ export class QueueApi {
         const id = input.job_id!;
         const row = await this.lockJob(client, id);
         if (operation === "cancel_job") {
-          if (!["queued", "retry", "running", "cancelled"].includes(row.status))
+          if (!["queued", "retry", "running", "completion_pending", "cancelled"].includes(row.status))
             throw new QueueError("invalid_state", `Cannot cancel ${row.status} job`);
           await this.cancel(client, id);
           response = {
             job_id: id,
-            status: row.status === "running" ? "running" : "cancelled",
+            status: ["running", "completion_pending"].includes(row.status) ? row.status : "cancelled",
             cancellation_requested: true,
           };
         } else {
           if (!["failed", "cancelled"].includes(row.status))
             throw new QueueError("invalid_state", "Only failed or cancelled jobs can be retried");
-          await this.retry(client, id);
+          if (!(await this.retry(client, id)))
+            throw new QueueError("invalid_state", "Completed execution cannot be retried; recover completion persistence instead");
           response = { job_id: id, status: "retry" };
         }
       } else throw new QueueError("invalid_arguments", "Unknown mutation");
@@ -222,14 +238,18 @@ export class QueueApi {
   async cancel(client: PoolClient | Pool, id: number): Promise<AgentRunRow | undefined> {
     return (
       await client.query<AgentRunRow>(
-        `UPDATE ${this.table} SET cancel_requested_at=coalesce(cancel_requested_at,now()), updated_at=now(), status=CASE WHEN status='running' THEN status ELSE 'cancelled' END, finished_at=CASE WHEN status='running' THEN finished_at ELSE coalesce(finished_at,now()) END WHERE id=$1 AND status IN ('queued','retry','running','cancelled') RETURNING *`,
+        `UPDATE ${this.table} SET cancel_requested_at=coalesce(cancel_requested_at,now()), updated_at=now(), status=CASE WHEN status IN ('running','completion_pending') THEN status ELSE 'cancelled' END, finished_at=CASE WHEN status IN ('running','completion_pending') THEN finished_at ELSE coalesce(finished_at,now()) END WHERE id=$1 AND status IN ('queued','retry','running','completion_pending','cancelled') RETURNING *`,
         [id],
       )
     ).rows[0];
   }
   async retry(client: PoolClient | Pool, id: number): Promise<boolean> {
     const r = await client.query(
-      `UPDATE ${this.table} SET status='retry', num_retries=greatest(coalesce(num_retries,0),coalesce(attempts,0)), finished_at=NULL,updated_at=now(),locked_by=NULL,locked_at=NULL,heartbeat_at=NULL,cancel_requested_at=NULL WHERE id=$1 AND status IN ('failed','cancelled') RETURNING id`,
+      `UPDATE ${this.table} SET status='retry', num_retries=greatest(coalesce(num_retries,0),coalesce(attempts,0)), finished_at=NULL,updated_at=now(),locked_by=NULL,locked_at=NULL,heartbeat_at=NULL,cancel_requested_at=NULL WHERE id=$1 AND status IN ('failed','cancelled')
+       AND NOT EXISTS (SELECT 1 FROM ${this.attempts} a WHERE a.run_id=${this.table}.id AND a.attempt_number=${this.table}.attempts
+         AND (a.exit_code=0 OR a.metadata ? 'completion_digest'))
+       AND NOT EXISTS (SELECT 1 FROM ${this.events} e WHERE e.run_id=${this.table}.id AND e.attempt_number=${this.table}.attempts
+         AND e.source='lifecycle' AND e.kind='result' AND e.data->>'exit_code'='0') RETURNING id`,
       [id],
     );
     return !!r.rows[0];
@@ -483,22 +503,30 @@ export class QueueApi {
       );
     });
   }
-  async finishAttempt(client: PoolClient, row: AgentRunRow, result?: ExecutionResult): Promise<void> {
-    await client.query(
-      `UPDATE ${this.attempts} SET status=$3,phase='finished',finished_at=now(),metadata=metadata || jsonb_strip_nulls($4::jsonb),configuration=$5::jsonb,result=$6::jsonb,error=$7::jsonb,exit_code=$8,last_message=$9,output_complete=$10 WHERE run_id=$1 AND attempt_number=$2 AND status='running'`,
+  async finishAttempt(
+    client: PoolClient,
+    row: FinishedAttemptRow,
+    result?: ExecutionResult,
+    completion?: { workerId: string; digest: string },
+  ): Promise<void> {
+    const updated = await client.query(
+      `UPDATE ${this.attempts} SET status=$3,phase='finished',finished_at=now(),metadata=metadata || jsonb_strip_nulls($4::jsonb),configuration=$5::jsonb,result=$6::jsonb,error=$7::jsonb,exit_code=$8,last_message=$9,output_complete=$10 WHERE run_id=$1 AND attempt_number=$2 AND status='running' AND ($11::text IS NULL OR worker_id=$11) RETURNING run_id`,
       [
         row.id,
         row.attempts,
         row.status === "retry" ? "failed" : row.status,
-        json(metadata(row)),
+        json({ ...metadata(row), ...(completion ? { completion_digest: completion.digest } : {}) }),
         json(configuration(row)),
         json(redactValue(result?.result ?? null)),
         json(redactValue(row.error)),
         result?.exitCode ?? row.exit_code,
         cleanText(redactSecrets(result?.lastMessage ?? "")),
         result?.outputComplete ?? false,
+        completion?.workerId ?? null,
       ],
     );
+    if (completion && (updated.rowCount ?? 0) !== 1)
+      throw new QueueError("lost_ownership", "Attempt changed while persisting completion");
   }
 }
 function cleanText(value: string): string {
@@ -510,7 +538,7 @@ function json(value: unknown): string {
     (_match, prefix: string, escaped: string) => `${prefix}${escaped}\\ufffd`,
   );
 }
-function configuration(row: AgentRunRow): Record<string, unknown> {
+function configuration(row: FinishedAttemptRow): Record<string, unknown> {
   return {
     provider: row.agent_provider,
     mode: row.agent_mode,
@@ -519,7 +547,7 @@ function configuration(row: AgentRunRow): Record<string, unknown> {
     base_branch: row.base_branch,
   };
 }
-function metadata(row: AgentRunRow): Record<string, unknown> {
+function metadata(row: FinishedAttemptRow): Record<string, unknown> {
   return {
     session_id: row.session_id,
     repo_path: row.repo_path,

@@ -1,7 +1,7 @@
 export type AgentProvider = "codex" | "claude";
 export type AgentProviderMode = AgentProvider | "both";
 export type AgentMode = "exec" | "app-server";
-export type RunStatus = "queued" | "retry" | "running" | "succeeded" | "failed" | "cancelled";
+export type RunStatus = "queued" | "retry" | "running" | "completion_pending" | "succeeded" | "failed" | "cancelled";
 export type WorktreeMode = "auto" | "always" | "never";
 export type RunWorkspaceMode = "cwd" | "worktree";
 export type SetupMode = "auto" | "always" | "never";
@@ -189,6 +189,8 @@ export interface ExecutionResult {
   sessionId?: string;
   resumeUnavailable?: boolean;
   outputComplete?: boolean;
+  /** Final lifecycle marker expected in the durable attempt journal. */
+  journalEndSequence?: number;
 }
 
 export interface WorkspaceResult {

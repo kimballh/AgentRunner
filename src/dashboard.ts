@@ -152,6 +152,7 @@ export function renderRunsPage(input: {
     .status-succeeded { color: #197044; }
     .status-failed { color: #b42318; }
     .status-retry { color: #7a5b00; }
+    .status-completion_pending { color: #7a5b00; }
     .status-cancelled, .status-stopping { color: #b54708; }
     .muted { color: #667085; }
     .actions { display: flex; gap: 6px; flex-wrap: wrap; min-width: 172px; }
@@ -291,7 +292,7 @@ export function renderRunsPage(input: {
 function runRow(run: RunListItem): string {
   const displayStatus = run.status === "running" && run.cancel_requested_at ? "stopping" : run.status;
   return `<tr>
-    <td><span class="status status-${escapeHtml(displayStatus)}">${escapeHtml(displayStatus)}</span></td>
+    <td><span class="status status-${escapeHtml(displayStatus)}">${escapeHtml(displayStatus === "completion_pending" ? "completion pending" : displayStatus)}</span></td>
     <td><strong>${escapeHtml(run.uid)}</strong><br><code>#${run.id}</code></td>
     <td>${escapeHtml(run.agent_provider ?? "")}</td>
     <td>${escapeHtml(run.agent_mode ?? "")}</td>
