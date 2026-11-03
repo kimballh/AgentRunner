@@ -626,6 +626,14 @@ export class AgentRunStore {
   async completeSuccess(receipt: CompletionReceipt): Promise<CompletionOutcome> {
     if (receipt.result.exitCode !== 0) throw new Error("Success completion requires exitCode=0");
     const result = receipt.result;
+    // Prepare potentially large output before opening a transaction. Local
+    // redaction/serialization must not leave the database idle in transaction.
+    const params = [receipt.runId, receipt.workerId, receipt.attemptNumber,
+      nullablePostgresText(result.link), nullablePostgresText(result.lastMessage),
+      stringifyPostgresJson(redactValue(result.conversation ?? null)), sanitizePostgresText(redactSecrets(result.logs)),
+      stringifyPostgresJson(redactValue(result.result ?? null)), result.exitCode, nullablePostgresText(result.sessionId),
+      nullablePostgresText(result.workspace?.setupLogs), nullablePostgresText(result.workspace?.cleanupNote),
+      stringifyPostgresJson({ message: "cancelled by user" })];
     const outcome = await this.queue.transaction(async (client): Promise<CompletionOutcome | undefined> => {
       const updated = await client.query<FinishedAttemptRow>(
         `UPDATE ${this.table}
@@ -637,12 +645,7 @@ export class AgentRunStore {
              locked_by=NULL,locked_at=NULL,heartbeat_at=NULL
          WHERE id=$1 AND locked_by=$2 AND attempts=$3 AND status IN ('running','completion_pending')
          RETURNING ${finishedAttemptColumns}`,
-        [receipt.runId, receipt.workerId, receipt.attemptNumber,
-          nullablePostgresText(result.link), nullablePostgresText(result.lastMessage),
-          stringifyPostgresJson(redactValue(result.conversation ?? null)), sanitizePostgresText(redactSecrets(result.logs)),
-          stringifyPostgresJson(redactValue(result.result ?? null)), result.exitCode, nullablePostgresText(result.sessionId),
-          nullablePostgresText(result.workspace?.setupLogs), nullablePostgresText(result.workspace?.cleanupNote),
-          stringifyPostgresJson({ message: "cancelled by user" })],
+        params,
       );
       const row = updated.rows[0];
       if (!row) return undefined;

@@ -1,5 +1,7 @@
 const SECRET_PATTERNS = [
-  /([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|DATABASE_URL)[A-Z0-9_]*=)([^\s]+)/gi,
+  // Only start at the beginning of a name. Retrying at every character of a
+  // long token without an assignment makes the greedy name scan quadratic.
+  /(?<![A-Z0-9_])([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|DATABASE_URL)[A-Z0-9_]*=)([^\s]+)/gi,
   /(postgres(?:ql)?:\/\/[^:\s]+:)([^@\s]+)(@)/gi,
 ];
 
