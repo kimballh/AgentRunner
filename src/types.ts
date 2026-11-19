@@ -226,4 +226,5 @@ export interface ExecutionEvent {
   text?: string;
   data?: unknown;
 }
-export type ExecutionObserver = (event: ExecutionEvent) => void;
+/** Output producers await a returned promise before reading more output. */
+export type ExecutionObserver = (event: ExecutionEvent) => void | Promise<void>;

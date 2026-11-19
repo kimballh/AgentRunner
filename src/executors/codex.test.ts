@@ -50,7 +50,7 @@ process.stdout.write(JSON.stringify({ type: "turn.completed" }) + "\\n");
     }
   });
 
-  test("stops long-lived app-server after turn completion", async () => {
+  test("stops long-lived app-server and drains output after turn completion", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "agentrunner-codex-test-"));
     const fakeCodexBin = path.join(tempDir, "fake-codex-app-server.js");
     await fs.writeFile(
@@ -74,24 +74,35 @@ lines.on("line", (line) => {
   }
 });
 
-process.on("SIGTERM", () => process.exit(0));
+process.on("SIGTERM", () => {
+  process.stdout.write("fake app-server shutdown\\n", () => process.exit(0));
+});
 setInterval(() => undefined, 1000);
 `,
       { mode: 0o755 },
     );
 
     try {
+      let recordedShutdown = false;
       const result = await runCodex({
         prompt: "finish",
         cwd: tempDir,
         resolved: { provider: "codex", mode: "app-server" },
         config: testConfig(fakeCodexBin, tempDir),
+        observe: async (event) => {
+          if (event.text === "fake app-server shutdown") {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            recordedShutdown = true;
+          }
+        },
       });
 
       expect(result.exitCode).toBe(0);
       expect(result.link).toBe("codex://threads/fake-thread");
       expect(result.lastMessage).toBe("done");
       expect(result.logs).toContain("fake app-server ready");
+      expect(result.logs).toContain("fake app-server shutdown");
+      expect(recordedShutdown).toBe(true);
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }

@@ -14,6 +14,8 @@ export interface ProcessResult {
 
 const DEFAULT_TERMINATION_GRACE_MS = 5_000;
 
+export type OutputLineHandler = (line: string) => void | Promise<void>;
+
 export class CommandError extends Error {
   constructor(
     message: string,
@@ -36,8 +38,8 @@ export async function runProcess(
     stdin?: string;
     signal?: AbortSignal;
     terminationGraceMs?: number;
-    onStdoutLine?: (line: string) => void;
-    onStderrLine?: (line: string) => void;
+    onStdoutLine?: OutputLineHandler;
+    onStderrLine?: OutputLineHandler;
     maxCaptureBytes?: number;
   },
 ): Promise<ProcessResult> {
@@ -81,8 +83,8 @@ export async function runCommandOrThrow(
     cwd: string;
     label: string;
     signal?: AbortSignal;
-    onStdoutLine?: (line: string) => void;
-    onStderrLine?: (line: string) => void;
+    onStdoutLine?: OutputLineHandler;
+    onStderrLine?: OutputLineHandler;
   },
 ): Promise<ProcessResult> {
   const result = await runProcess(command, options);
@@ -163,7 +165,7 @@ export function signalSubprocess(subprocess: ChildProcess, signal: NodeJS.Signal
 
 export async function streamToString(
   stream: Readable,
-  onLine?: (line: string) => void,
+  onLine?: OutputLineHandler,
   maxBytes = 32 * 1024 * 1024,
 ): Promise<string> {
   const chunks: Buffer[] = [];
@@ -171,7 +173,7 @@ export async function streamToString(
   const decoder = new StringDecoder("utf8");
   let pending = "";
   let skipped = false;
-  const consume = (text: string): void => {
+  const consume = async (text: string): Promise<void> => {
     if (!onLine) return;
     for (const part of text.match(/[^\n]*\n|[^\n]+$/g) ?? []) {
       const ended = part.endsWith("\n");
@@ -181,23 +183,24 @@ export async function streamToString(
         skipped = true;
       }
       if (ended) {
-        onLine(skipped ? "[oversized output line omitted]" : pending.replace(/\r?\n$/, ""));
+        const pressure = onLine(skipped ? "[oversized output line omitted]" : pending.replace(/\r?\n$/, ""));
         pending = "";
         skipped = false;
+        if (pressure) await pressure;
       }
     }
   };
   for await (const chunk of stream) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-    consume(decoder.write(buffer));
+    await consume(decoder.write(buffer));
     if (captured < maxBytes) {
       const kept = buffer.subarray(0, maxBytes - captured);
       chunks.push(kept);
       captured += kept.length;
     }
   }
-  consume(decoder.end());
-  if (onLine && (pending || skipped)) onLine(skipped ? "[oversized output line omitted]" : pending);
+  await consume(decoder.end());
+  if (onLine && (pending || skipped)) await onLine(skipped ? "[oversized output line omitted]" : pending);
   return Buffer.concat(chunks).toString("utf8");
 }
 
