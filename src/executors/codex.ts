@@ -56,18 +56,18 @@ async function runCodexExec(input: ExecutionInput): Promise<ExecutionResult> {
       stdin: input.prompt,
       signal: input.signal,
       maxCaptureBytes: input.config.outputMaxBytes,
-      onStdoutLine: (line) => {
-        input.observe?.({ source: "logs", kind: "stdout", text: line });
+      onStdoutLine: async (line) => {
+        await input.observe?.({ source: "logs", kind: "stdout", text: line });
         const event = parseJsonObject(line);
         if (event)
-          input.observe?.({
+          await input.observe?.({
             source: "conversation",
             kind: "provider",
             data: event,
           });
         const session = parseExecThreadId(line);
         if (session && session !== streamedThread)
-          input.observe?.({
+          await input.observe?.({
             source: "lifecycle",
             kind: "session",
             text: session,
@@ -145,6 +145,7 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
     return promise;
   };
 
+  let stdoutPromise: Promise<void> | undefined;
   const completedPromise = new Promise<void>((resolve, reject) => {
     const failPending = (error: Error): void => {
       for (const item of pending.values()) {
@@ -153,10 +154,10 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
       pending.clear();
     };
 
-    void streamToString(
+    stdoutPromise = streamToString(
       subprocess.stdout,
-      (line) => {
-        input.observe?.({ source: "logs", kind: "stdout", text: line });
+      async (line) => {
+        await input.observe?.({ source: "logs", kind: "stdout", text: line });
         const capture = capturedBytes + Buffer.byteLength(line) <= (input.config.outputMaxBytes ?? 32 * 1024 * 1024);
         if (capture) {
           stdoutLines.push(line);
@@ -166,7 +167,7 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
         if (!message) {
           return;
         }
-        input.observe?.({
+        await input.observe?.({
           source: "conversation",
           kind: "provider",
           data: message,
@@ -224,6 +225,11 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
     (line) => input.observe?.({ source: "logs", kind: "stderr", text: line }),
     input.config.outputMaxBytes,
   );
+  const stop = async (): Promise<string> => {
+    const stderr = await stopAppServer(subprocess, closePromise, stderrPromise);
+    await stdoutPromise;
+    return redactSecrets(stderr);
+  };
   try {
     await request("initialize", {
       clientInfo: {
@@ -261,7 +267,7 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
       throw new Error("codex app-server did not return a thread id");
     }
 
-    input.observe?.({ source: "lifecycle", kind: "session", text: threadId });
+    await input.observe?.({ source: "lifecycle", kind: "session", text: threadId });
     await request("turn/start", {
       threadId,
       input: [{ type: "text", text: input.prompt, text_elements: [] }],
@@ -270,7 +276,7 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
     });
 
     await completedPromise;
-    const stderr = redactSecrets(await stopAppServer(subprocess, closePromise, stderrPromise));
+    const stderr = await stop();
     return {
       exitCode: 0,
       link: threadUrl(threadId),
@@ -281,7 +287,7 @@ async function runCodexAppServer(input: ExecutionInput): Promise<ExecutionResult
       sessionId: threadId,
     };
   } catch (error) {
-    const stderr = redactSecrets(await stopAppServer(subprocess, closePromise, stderrPromise).catch(() => ""));
+    const stderr = await stop().catch(() => "");
     return {
       exitCode: 1,
       link: threadId ? threadUrl(threadId) : undefined,
