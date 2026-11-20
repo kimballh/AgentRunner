@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
-import { CommandError } from "./process.js";
+import { CommandError, runCommandOrThrow } from "./process.js";
 import {
   prepareReusedWorkspace,
   prepareWorkspace,
@@ -200,6 +200,60 @@ describe("workspace", () => {
     });
 
     expect(runner.commands.map((item) => item.command.join(" "))).toContain(`git worktree remove ${old}`);
+  });
+
+  test.each([
+    { state: "already absent", branchInUse: false },
+    { state: "checked out in another worktree", branchInUse: true },
+  ])("cleanup handles a worktree branch that is $state", async ({ branchInUse }) => {
+    const repo = await tempDir();
+    try {
+      const old = path.join(repo, ".worktrees", "old");
+      const branch = "agentrunner/run-1";
+      const git = (...args: string[]) =>
+        runCommandOrThrow(["git", ...args], { cwd: repo, label: "set up Git test fixture" });
+
+      await git("init", "-b", "main");
+      await git(
+        "-c", "user.name=Test",
+        "-c", "user.email=test@example.com",
+        "-c", "commit.gpgsign=false",
+        "-c", "core.hooksPath=/dev/null",
+        "commit", "--allow-empty", "-m", "initial",
+      );
+      await git("remote", "add", "origin", ".");
+      await git("worktree", "add", "--detach", old, "HEAD");
+      if (branchInUse) {
+        await git("worktree", "add", "-b", branch, path.join(repo, "active"), "HEAD");
+      }
+
+      const preparation = prepareWorkspace({
+        config: serviceConfig({
+          cwd: repo,
+          git: {
+            ...gitConfig(),
+            repo,
+            baseBranch: "HEAD",
+            maxWorktrees: 1,
+            cleanupBatchSize: 1,
+            cleanupDeleteBranches: true,
+          },
+        }),
+        run: row({ id: 100 }),
+        completedRuns: [cleanupRow(1, old)],
+      });
+
+      if (branchInUse) {
+        await expect(preparation).rejects.toThrow(/cannot delete branch/i);
+        await git("show-ref", "--verify", "refs/heads/" + branch);
+      } else {
+        const workspace = await preparation;
+        expect(workspace.cleanupNote).toContain("removed 1 old clean worktree");
+        expect((await fs.stat(workspace.cwd)).isDirectory()).toBe(true);
+      }
+    } finally {
+      await fs.rm(repo, { recursive: true, force: true });
+    }
   });
 
   test("cleanup preserves dirty completed worktrees by default", async () => {
