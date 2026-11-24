@@ -4,7 +4,7 @@ import path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { parseRunWorkspaceMode } from "./config.js";
 import { runPreflightPhase } from "./preflight.js";
-import { runCommandOrThrow, runProcess, type OutputLineHandler, type ProcessResult } from "./process.js";
+import { CommandError, runCommandOrThrow, runProcess, type OutputLineHandler, type ProcessResult } from "./process.js";
 import type {
   AgentRunRow,
   CompletedRunForCleanup,
@@ -502,12 +502,10 @@ async function removeCleanupCandidates(
     if (candidate.runId !== undefined) {
       await input.onWorktreeRemoved?.(candidate.runId, "worktree removed by cleanup");
     }
-    if (input.config.git.cleanupDeleteBranches && candidate.branchName) {
+    const branchName = candidate.branchName;
+    if (input.config.git.cleanupDeleteBranches && branchName) {
       await workspacePhase(input.config, "delete old Git worktree branch", () =>
-        input.runner.run(["git", "branch", "-D", candidate.branchName!], {
-          cwd: input.repoRoot,
-          label: "delete old worktree branch",
-        }),
+        deleteWorktreeBranch(input.runner, input.repoRoot, branchName),
       );
     }
     if (candidateIsDirty) {
@@ -517,6 +515,26 @@ async function removeCleanupCandidates(
   }
 
   return { checked, removed, dirty, deletedDirty };
+}
+
+async function deleteWorktreeBranch(runner: WorkspaceCommandRunner, cwd: string, branchName: string): Promise<void> {
+  try {
+    await runner.run(["git", "branch", "-D", "--", branchName], { cwd, label: "delete old worktree branch" });
+  } catch (error) {
+    if (!(error instanceof CommandError) || error.exitCode !== 1) {
+      throw error;
+    }
+
+    // Check the exact ref after the failure so concurrent deletion is safe even with localized Git output.
+    const ref = `refs/heads/${branchName}`;
+    const remaining = await runner.run(["git", "for-each-ref", "--format=%(refname)", "--", ref], {
+      cwd,
+      label: "verify old worktree branch absence",
+    });
+    if (remaining.stderr.trim() || remaining.stdout.split(/\r?\n/).includes(ref)) {
+      throw error;
+    }
+  }
 }
 
 async function orphanedRegisteredWorktrees(input: {
