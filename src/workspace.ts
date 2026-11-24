@@ -4,7 +4,7 @@ import path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { parseRunWorkspaceMode } from "./config.js";
 import { runPreflightPhase } from "./preflight.js";
-import { CommandError, runCommandOrThrow, runProcess, type ProcessResult } from "./process.js";
+import { CommandError, runCommandOrThrow, runProcess, type OutputLineHandler, type ProcessResult } from "./process.js";
 import type {
   AgentRunRow,
   CompletedRunForCleanup,
@@ -716,8 +716,8 @@ function errorMessage(error: unknown): string {
 }
 
 function observedOutput(observe?: ExecutionObserver): {
-  onStdoutLine: (line: string) => void;
-  onStderrLine: (line: string) => void;
+  onStdoutLine: OutputLineHandler;
+  onStderrLine: OutputLineHandler;
 } {
   return {
     onStdoutLine: (line) => observe?.({ source: "setup", kind: "stdout", text: line }),

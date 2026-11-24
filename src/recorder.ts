@@ -2,6 +2,9 @@ import { redactValue } from "./redact.js";
 import type { QueueApi, JournalEvent } from "./queue-api.js";
 import type { ExecutionEvent, ExecutionObserver } from "./types.js";
 
+const FLUSH_BYTES = 64 * 1024;
+const BACKPRESSURE_BYTES = 4 * 1024 * 1024;
+
 /** One writer per claimed attempt, with stable sequence numbers for ambiguous DB retries. */
 export class AttemptRecorder {
   private pending: JournalEvent[] = [];
@@ -10,10 +13,10 @@ export class AttemptRecorder {
   private queuedBytes = 0;
   private truncated = false;
   private failure?: Error;
-  private chain: Promise<void> = Promise.resolve();
+  private writing?: Promise<void>;
   private timer: NodeJS.Timeout;
   constructor(
-    private queue: QueueApi,
+    private queue: Pick<QueueApi, "append">,
     private id: number,
     private attempt: number,
     private worker: string,
@@ -67,9 +70,13 @@ export class AttemptRecorder {
     }
     if (output) this.bytes += size;
     this.enqueue(safe);
-    // Bound the live recording backlog independently of the lifetime output cap.
-    if (this.queuedBytes > 1024 * 1024) this.fail(new Error("Attempt output recorder backlog exceeded 1 MiB"));
-    else if (this.queuedBytes >= 65536) void this.flush().catch(() => undefined);
+    if (this.queuedBytes >= BACKPRESSURE_BYTES) {
+      // The reader pauses until persistence catches up or the recorder aborts the job.
+      return this.flush().catch(() => undefined);
+    }
+    if (this.queuedBytes >= FLUSH_BYTES && !this.writing) {
+      void this.flush().catch(() => undefined);
+    }
   };
   private enqueue(event: ExecutionEvent): void {
     this.pending.push({ ...event, sequence: ++this.sequence });
@@ -78,28 +85,41 @@ export class AttemptRecorder {
   phase(value: string): void {
     this.observe({ source: "lifecycle", kind: "phase", text: value });
   }
-  async flush(): Promise<void> {
-    this.chain = this.chain.then(async () => {
-      if (this.failure) throw this.failure;
-      const batch = this.pending.splice(0);
-      this.queuedBytes = 0;
-      if (!batch.length) return;
-      let last: unknown;
-      for (let retry = 0; retry < 3; retry++) {
-        try {
-          await this.queue.append(this.id, this.attempt, this.worker, batch);
-          return;
-        } catch (error) {
-          last = error;
-          if (retry < 2) await new Promise((r) => setTimeout(r, 100 * (retry + 1)));
-        }
+  private flush(): Promise<void> {
+    if (this.failure) return Promise.reject(this.failure);
+    if (this.writing) return this.writing;
+    if (!this.pending.length) return Promise.resolve();
+    this.writing = this.drain();
+    return this.writing;
+  }
+  private async drain(): Promise<void> {
+    try {
+      while (this.pending.length) {
+        const batch = this.pending;
+        const batchBytes = this.queuedBytes;
+        this.pending = [];
+        await this.append(batch);
+        // Count the batch against the watermark until the write succeeds.
+        this.queuedBytes -= batchBytes;
       }
-      this.fail(new Error("Unable to persist attempt output", { cause: last }));
-      throw this.failure;
-    });
-    // Retain failure but attach a handler immediately for interval callers.
-    void this.chain.catch(() => undefined);
-    return this.chain;
+    } finally {
+      this.writing = undefined;
+    }
+  }
+  private async append(batch: JournalEvent[]): Promise<void> {
+    let last: unknown;
+    for (let retry = 0; retry < 3; retry++) {
+      try {
+        await this.queue.append(this.id, this.attempt, this.worker, batch);
+        return;
+      } catch (error) {
+        last = error;
+        if (retry < 2) await new Promise((r) => setTimeout(r, 100 * (retry + 1)));
+      }
+    }
+    const failure = new Error("Unable to persist attempt output", { cause: last });
+    this.fail(failure);
+    throw failure;
   }
   async finish(): Promise<boolean> {
     clearInterval(this.timer);

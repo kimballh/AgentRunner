@@ -10,18 +10,18 @@ export async function runClaude(input: ExecutionInput): Promise<ExecutionResult>
     stdin: input.prompt,
     signal: input.signal,
     maxCaptureBytes: input.config.outputMaxBytes,
-    onStdoutLine: (line) => {
-      input.observe?.({ source: "logs", kind: "stdout", text: line });
+    onStdoutLine: async (line) => {
+      await input.observe?.({ source: "logs", kind: "stdout", text: line });
       const event = parseClaudeOutput(line);
       if (event) {
-        input.observe?.({
+        await input.observe?.({
           source: "conversation",
           kind: "provider",
           data: event,
         });
         const session = sessionIdFrom(event);
         if (session && session !== streamedSession)
-          input.observe?.({
+          await input.observe?.({
             source: "lifecycle",
             kind: "session",
             text: session,

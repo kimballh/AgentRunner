@@ -66,6 +66,50 @@ describe("durable output capture", () => {
     expect(saved.filter((e) => e.kind === "truncated")).toHaveLength(1);
     expect(saved.at(-1)?.text).toBe("finalizing");
   });
+  test("pauses a burst at the backlog watermark and resumes without losing output", async () => {
+    const saved: JournalEvent[] = [];
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    let reachedWatermark!: () => void;
+    const watermark = new Promise<void>((resolve) => { reachedWatermark = resolve; });
+    const append: QueueApi["append"] = async (_id, _attempt, _worker, events) => {
+      await writeGate;
+      saved.push(...events);
+    };
+    const abort = vi.fn();
+    const recorder = new AttemptRecorder({ append }, 1, 1, "worker", abort);
+    const line = "output ".repeat(4500);
+    const lineCount = 180;
+    const burst = `${line}\n`.repeat(lineCount);
+    let consumed = 0;
+    const reading = streamToString(Readable.from([burst]), (text) => {
+      consumed++;
+      const pressure = recorder.observe({ source: "logs", kind: "stdout", text });
+      if (pressure) reachedWatermark();
+      return pressure;
+    });
+    try {
+      // The old recorder aborted here, so race the reader to get a direct failure.
+      await Promise.race([watermark, reading]);
+      expect(abort).not.toHaveBeenCalled();
+      expect(consumed * Buffer.byteLength(line)).toBeGreaterThan(3 * 1024 * 1024);
+      expect(consumed * Buffer.byteLength(line)).toBeLessThan(4.1 * 1024 * 1024);
+      expect(consumed).toBeLessThan(lineCount);
+      expect(saved).toHaveLength(0);
+    } finally {
+      releaseWrite();
+      await reading;
+      recorder.phase("finalizing");
+      await recorder.finish();
+    }
+    expect(recorder.error).toBeUndefined();
+    expect(consumed).toBe(lineCount);
+    expect(saved.filter((event) => event.text === line)).toHaveLength(lineCount);
+    expect(saved.map((event) => event.sequence)).toEqual(
+      Array.from({ length: lineCount + 1 }, (_, index) => index + 1),
+    );
+    expect(saved.at(-1)?.text).toBe("finalizing");
+  });
   test("aborts on persistent persistence failure without claiming complete output", async () => {
     const abort = vi.fn();
     const append = vi.fn().mockRejectedValue(new Error("offline"));
@@ -79,7 +123,7 @@ describe("durable output capture", () => {
     const lines: string[] = [];
     const output = await streamToString(
       Readable.from(["x".repeat(100000), "\nlast\n"]),
-      (line) => lines.push(line),
+      (line) => { lines.push(line); },
       20,
     );
     expect(output).toHaveLength(20);
